@@ -1,0 +1,8476 @@
+//! The egui application: map + satellite layers, timeline, charts, weather annotation, export.
+
+mod movement_ui;
+mod ocean_ui;
+
+use crate::firmware;
+use crate::geo;
+use crate::model::{ArgosLc, Fix, LocationSource, SensorKind, Track};
+use crate::share::{self, ShareMap};
+use crate::table::{Table, fmt_date, fmt_time};
+use crate::tiles::{Basemap, Gibs, SatLayer};
+use crate::video;
+use crate::view3d::{Scene, View3D};
+use crate::weather::{self, AnnotateOptions, Model, Request, WeatherStore, WindLevel};
+use crate::wind3d::{
+    self, Curtain, CurtainMetric, FieldSlice, OmModel, ProfileRequest, ProfileStore,
+};
+use egui::{Align2, Color32, ColorImage, FontId, Pos2, Rect, Stroke, Ui, pos2, vec2};
+use egui_plot::{GridMark, HoverPosition, Legend, Line, Plot, PlotPoints, Points, VLine};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use walkers::{HttpTiles, MapMemory, Plugin, Position, Projector, Tiles, lon_lat};
+
+// ---------------------------------------------------------------------------
+// Messages from background work (file pickers, HTTP)
+// ---------------------------------------------------------------------------
+
+enum Msg {
+    File {
+        name: String,
+        bytes: Vec<u8>,
+    },
+    Weather {
+        id: usize,
+        result: Result<String, String>,
+    },
+    Status(String),
+    /// A CSV downloaded from a URL (Open URL… or a shared link).
+    RemoteFile {
+        url: String,
+        bytes: Vec<u8>,
+        force: Option<String>,
+        from_share: bool,
+    },
+    FetchFailed {
+        url: String,
+        err: String,
+        from_share: bool,
+    },
+    /// A step of a Copernicus CDS job: HTTP status and body, or a network error.
+    Cds {
+        run: u64,
+        result: Result<(u16, Vec<u8>), String>,
+    },
+    /// An Overpass (OpenStreetMap) answer for a batch of structure tiles.
+    Overpass {
+        tiles: Vec<crate::structures::Tile>,
+        result: Result<String, String>,
+    },
+    /// IBTrACS cyclone table (ERDDAP subset or imported CSV), or one year file served
+    /// with the app (`year` set).
+    Cyclones {
+        name: String,
+        result: Result<Vec<u8>, String>,
+        year: Option<i32>,
+    },
+    /// A wind-turbine / structure register CSV picked by the user.
+    StructFile {
+        name: String,
+        bytes: Vec<u8>,
+    },
+    /// An Open-Meteo Marine response.
+    Marine {
+        req: crate::marine::Request,
+        tries: u8,
+        result: Result<String, String>,
+    },
+}
+
+/// One queued download.
+enum Job {
+    Surface(Request),
+    Profile(ProfileRequest),
+}
+
+impl Job {
+    /// Estimated Open-Meteo call count (see [`weather::call_weight`]).
+    fn weight(&self) -> f32 {
+        match self {
+            Job::Surface(r) => r.weight(),
+            Job::Profile(r) => r.weight(),
+        }
+    }
+
+    fn url(&self) -> &str {
+        match self {
+            Job::Surface(r) => &r.url,
+            Job::Profile(r) => &r.url,
+        }
+    }
+}
+
+/// Where point annotation gets ERA5 surface data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Era5Source {
+    /// Open-Meteo archive API: free, no key, limits per IP address (shared by everyone on
+    /// the same network).
+    OpenMeteo,
+    /// Copernicus Climate Data Store with the user's own key and quota.
+    Cds,
+}
+
+impl Era5Source {
+    fn label(self) -> &'static str {
+        match self {
+            Era5Source::OpenMeteo => "Open-Meteo (free, no key)",
+            Era5Source::Cds => "Copernicus CDS (your API key)",
+        }
+    }
+}
+
+/// Stage of one CDS cell job.
+#[derive(Clone, Debug)]
+enum CdsStage {
+    Submit,
+    Poll(String),
+    Results(String),
+    Download(String),
+}
+
+#[derive(Clone, Debug)]
+struct CdsRun {
+    id: u64,
+    job: crate::cds::CellJob,
+    stage: CdsStage,
+    /// A request for this run is in flight.
+    busy: bool,
+    /// Don't poll again before this time (app clock, s).
+    next_at: f64,
+    polls: u32,
+}
+
+/// Structures to draw on the map, and the steps to highlight (if on).
+type StructLayer<'a> = (
+    crate::structures::Draw<'a>,
+    Option<&'a HashSet<(usize, usize)>>,
+);
+
+/// Structures analysis for the current tracks, store and parameters.
+struct StCache {
+    key: u64,
+    a: crate::structures::Analysis,
+    /// Structures within the radius of any visible track.
+    hits: HashSet<usize>,
+    /// (track, fix) whose arriving step passed within the radius of a turbine.
+    near: HashSet<(usize, usize)>,
+}
+
+/// Parallel CDS jobs (the CDS also queues per user, so more doesn't help).
+const CDS_PARALLEL: usize = 4;
+/// Give up on a hanging Open-Meteo request after this many seconds.
+const OM_TIMEOUT_S: f64 = 150.0;
+
+/// Parallel Open-Meteo requests when the service is healthy (1 after an overload error).
+const OM_PARALLEL: usize = 3;
+/// Attempts per request for transient errors (overloaded, timeouts, network).
+const OM_RETRIES: u8 = 6;
+
+enum OmFailure {
+    Daily,
+    Hourly,
+    /// Worth retrying later (`minute`: the per-minute rate limit).
+    Transient {
+        minute: bool,
+    },
+    /// The request itself is wrong (HTTP 4xx, API error): retrying won't help.
+    Permanent,
+}
+
+/// What an Open-Meteo error means for the queue.
+fn om_failure(e: &str) -> OmFailure {
+    let el = e.to_lowercase();
+    if e.starts_with("HTTP 429") || el.contains("too many") || el.contains("limit exceeded") {
+        if el.contains("daily") {
+            return OmFailure::Daily;
+        }
+        if el.contains("hourly") {
+            return OmFailure::Hourly;
+        }
+        return OmFailure::Transient { minute: true };
+    }
+    if e.starts_with("HTTP 4") {
+        return OmFailure::Permanent;
+    }
+    // HTTP 5xx ("The service is overloaded"), timeouts, network errors, truncated JSON
+    if e.starts_with("HTTP 5")
+        || el.contains("overload")
+        || el.contains("timed out")
+        || el.contains("timeout")
+        || el.contains("fetch")
+        || el.contains("network")
+        || el.contains("connect")
+        || el.contains("bad json")
+        || el.contains("expected")
+        || !e.starts_with("HTTP")
+            && !el.contains("parameter")
+            && !el.contains("invalid")
+            && !el.contains("out of")
+    {
+        return OmFailure::Transient { minute: false };
+    }
+    OmFailure::Permanent
+}
+
+/// First line of an error, without a JSON wrapper.
+fn short_err(e: &str) -> String {
+    let reason = e
+        .split("\"reason\":\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .map(|r| {
+            format!(
+                "{} {r}",
+                e.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+            )
+        });
+    reason.unwrap_or_else(|| e.lines().next().unwrap_or("").chars().take(120).collect())
+}
+
+/// Point an Open-Meteo URL at the customer servers when the user has an API key.
+fn om_url(url: &str, key: &str) -> String {
+    let key = key.trim();
+    if key.is_empty() {
+        return url.to_string();
+    }
+    format!(
+        "{}&apikey={key}",
+        url.replacen("https://", "https://customer-", 1)
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewTab {
+    Map,
+    ThreeD,
+}
+
+struct LoadedFile {
+    name: String,
+    bytes: Vec<u8>,
+    firmware: String,
+    /// Firmware chosen by the user (None = auto-detected).
+    forced: Option<String>,
+    origin: FileOrigin,
+    ranking: Vec<(&'static str, f32)>,
+}
+
+/// Where a file came from — decides how a share link carries it.
+#[derive(Clone, Debug, PartialEq)]
+enum FileOrigin {
+    Local,
+    Demo,
+    Url(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ColorBy {
+    Individual,
+    WindSupport,
+    SegmentWind,
+    GroundSpeed,
+    Time,
+    AccFlight,
+    AccWbf,
+    AccCluster,
+    AccBehaviour,
+    HmmState,
+    Segment,
+    Fpt,
+    Seafloor,
+    Sst,
+    CurrentSupport,
+    WaveHeight,
+    ArgosClass,
+    FixDepth,
+}
+
+impl ColorBy {
+    const ALL: [ColorBy; 17] = [
+        ColorBy::Individual,
+        ColorBy::ArgosClass,
+        ColorBy::GroundSpeed,
+        ColorBy::Time,
+        ColorBy::Seafloor,
+        ColorBy::FixDepth,
+        ColorBy::Sst,
+        ColorBy::CurrentSupport,
+        ColorBy::WaveHeight,
+        ColorBy::WindSupport,
+        ColorBy::AccFlight,
+        ColorBy::AccWbf,
+        ColorBy::AccCluster,
+        ColorBy::AccBehaviour,
+        ColorBy::HmmState,
+        ColorBy::Segment,
+        ColorBy::Fpt,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            ColorBy::Individual => "Individual",
+            ColorBy::WindSupport => "Wind along the heading (10 m)",
+            ColorBy::SegmentWind => "Along-step wind support",
+            ColorBy::GroundSpeed => "Ground speed",
+            ColorBy::Time => "Time",
+            ColorBy::AccFlight => "ACC: active share of the step",
+            ColorBy::AccWbf => "ACC: stroke frequency",
+            ColorBy::AccCluster => "ACC: behaviour cluster",
+            ColorBy::AccBehaviour => "ACC: behaviour (from annotations)",
+            ColorBy::HmmState => "Movement: HMM state",
+            ColorBy::Segment => "Movement: change-point segment",
+            ColorBy::Fpt => "Movement: first-passage time",
+            ColorBy::Seafloor => "Seafloor depth (bathymetry)",
+            ColorBy::Sst => "Sea surface temperature",
+            ColorBy::CurrentSupport => "Current along the heading",
+            ColorBy::WaveHeight => "Wave height",
+            ColorBy::ArgosClass => "Argos location class",
+            ColorBy::FixDepth => "Animal depth at the fix",
+        }
+    }
+}
+
+/// Colour scale for the ERA5 wind-field arrows (wind speed 0–20 m/s).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WindPalette {
+    Viridis,
+    Warm,
+    Cool,
+    Turbo,
+    White,
+    Black,
+}
+
+impl WindPalette {
+    const ALL: [WindPalette; 6] = [
+        WindPalette::Viridis,
+        WindPalette::Warm,
+        WindPalette::Cool,
+        WindPalette::Turbo,
+        WindPalette::White,
+        WindPalette::Black,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            WindPalette::Viridis => "Viridis (light maps)",
+            WindPalette::Warm => "Warm: white → yellow → magenta",
+            WindPalette::Cool => "Cool: cyan → magenta",
+            WindPalette::Turbo => "Turbo (rainbow)",
+            WindPalette::White => "White",
+            WindPalette::Black => "Black",
+        }
+    }
+    /// Satellite imagery is dark and busy, so it gets bright colours; street/topo maps are light.
+    fn default_for(b: Basemap) -> Self {
+        match b {
+            Basemap::EsriImagery => WindPalette::Warm,
+            Basemap::CartoDark => WindPalette::Cool,
+            Basemap::OpenStreetMap | Basemap::EsriTopo => WindPalette::Viridis,
+        }
+    }
+    /// `x` = wind speed / 20 m/s.
+    fn color(self, x: f32) -> Color32 {
+        match self {
+            WindPalette::Viridis => viridis(x),
+            WindPalette::Warm => lerp_stops(
+                &[
+                    [255.0, 255.0, 255.0],
+                    [255.0, 240.0, 80.0],
+                    [255.0, 170.0, 0.0],
+                    [255.0, 80.0, 40.0],
+                    [255.0, 0.0, 150.0],
+                ],
+                x,
+            ),
+            WindPalette::Cool => lerp_stops(&[[0.0, 255.0, 255.0], [255.0, 0.0, 255.0]], x),
+            WindPalette::Turbo => lerp_stops(
+                &[
+                    [48.0, 18.0, 59.0],
+                    [70.0, 130.0, 248.0],
+                    [27.0, 229.0, 181.0],
+                    [164.0, 252.0, 59.0],
+                    [251.0, 185.0, 56.0],
+                    [226.0, 66.0, 9.0],
+                    [122.0, 4.0, 3.0],
+                ],
+                x,
+            ),
+            WindPalette::White => Color32::WHITE,
+            WindPalette::Black => Color32::BLACK,
+        }
+    }
+    /// Contrasting outline drawn under each arrow.
+    fn halo(self) -> Option<Color32> {
+        match self {
+            WindPalette::Viridis => None,
+            WindPalette::Black => Some(Color32::from_white_alpha(170)),
+            _ => Some(Color32::from_black_alpha(170)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChartVar {
+    Altitude,
+    GroundSpeed,
+    WindSupport,
+    Era5Temp,
+    Precip,
+    LocError,
+    Sensor(SensorKind),
+    /// Time × height wind along one track (pressure levels).
+    Curtain,
+    /// Wind profile at the selected fix / cursor.
+    Profile,
+    /// Cloud base (lifting condensation level, m ASL) and low cloud cover.
+    CloudBase,
+    /// A per-burst acceleration metric over time.
+    Acc(AccMetric),
+    /// Waveform and spectrum of the burst nearest the cursor.
+    AccBurst,
+    /// Results of the movement analyses, and the net displacement.
+    Move(MoveMetric),
+    /// Ocean state, bathymetry and dives.
+    Ocean(OceanVar),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OceanVar {
+    /// Maximum depth of each dive (plotted downward) at the time of the dive.
+    DiveMax,
+    DiveDuration,
+    Seafloor,
+    WaveHeight,
+    SwellHeight,
+    WavePeriod,
+    CurrentSpeed,
+    CurrentSupport,
+    Sst,
+    SeaLevel,
+    Wind10,
+    Wind2,
+}
+
+impl OceanVar {
+    fn label(self) -> &'static str {
+        match self {
+            OceanVar::DiveMax => "Dives: maximum depth (m, downward)",
+            OceanVar::DiveDuration => "Dives: duration (min)",
+            OceanVar::Seafloor => "Seafloor depth under the fix (m, downward)",
+            OceanVar::WaveHeight => "Ocean: significant wave height (m)",
+            OceanVar::SwellHeight => "Ocean: swell height (m)",
+            OceanVar::WavePeriod => "Ocean: wave period (s)",
+            OceanVar::CurrentSpeed => "Ocean: surface current speed (m/s)",
+            OceanVar::CurrentSupport => "Ocean: current along the heading (m/s)",
+            OceanVar::Sst => "Ocean: sea surface temperature (°C)",
+            OceanVar::SeaLevel => "Ocean: sea level incl. tides (m)",
+            OceanVar::Wind10 => "Wind speed at 10 m (m/s, ERA5)",
+            OceanVar::Wind2 => "Wind speed at 2 m (m/s, log profile from 10 m)",
+        }
+    }
+    fn of(self, f: &Fix) -> Option<f32> {
+        let m = f.weather.marine.as_ref();
+        match self {
+            OceanVar::DiveMax | OceanVar::DiveDuration => None,
+            OceanVar::Seafloor => f.weather.seafloor_m.filter(|v| v.is_finite()),
+            OceanVar::WaveHeight => m.and_then(|m| m.wave_height_m),
+            OceanVar::SwellHeight => m.and_then(|m| m.swell_height_m),
+            OceanVar::WavePeriod => m.and_then(|m| m.wave_period_s),
+            OceanVar::CurrentSpeed => m.and_then(|m| m.current_ms),
+            OceanVar::CurrentSupport => m.and_then(|m| m.current_support),
+            OceanVar::Sst => m.and_then(|m| m.sst_c),
+            OceanVar::SeaLevel => m.and_then(|m| m.sea_level_m),
+            OceanVar::Wind10 => f
+                .weather
+                .wind_speed
+                .filter(|_| f.weather.level != Some("100m")),
+            OceanVar::Wind2 => f
+                .weather
+                .wind_speed
+                .filter(|_| f.weather.level != Some("100m"))
+                .map(crate::marine::wind_2m_from_10m),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MoveMetric {
+    Displacement,
+    Fpt,
+    Hmm,
+    Segment,
+}
+
+impl MoveMetric {
+    fn label(self) -> &'static str {
+        match self {
+            MoveMetric::Displacement => "Net displacement from the first fix (km)",
+            MoveMetric::Fpt => "Movement: first-passage time (h)",
+            MoveMetric::Hmm => "Movement: HMM state (1 = slowest)",
+            MoveMetric::Segment => "Movement: change-point segment",
+        }
+    }
+    fn of(self, f: &Fix) -> Option<f32> {
+        let m = f.mv.as_ref()?;
+        match self {
+            MoveMetric::Displacement => None,
+            MoveMetric::Fpt => m.fpt_h,
+            MoveMetric::Hmm => m.hmm_state.map(|s| s as f32 + 1.0),
+            MoveMetric::Segment => m.segment.map(|s| s as f32 + 1.0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AccMetric {
+    DynSd,
+    Vedba,
+    Wbf,
+    Pitch,
+    Cluster,
+    Behaviour,
+}
+
+impl AccMetric {
+    fn label(self) -> &'static str {
+        match self {
+            AccMetric::DynSd => "ACC: dynamic SD per burst (g)",
+            AccMetric::Vedba => "ACC: VeDBA per burst (g)",
+            AccMetric::Wbf => "ACC: wingbeat frequency of flight bursts (Hz)",
+            AccMetric::Pitch => "ACC: pitch (posture, °)",
+            AccMetric::Cluster => "ACC: behaviour cluster per burst",
+            AccMetric::Behaviour => "ACC: predicted behaviour per burst (from annotations)",
+        }
+    }
+    fn of(self, r: &crate::acc::Row) -> Option<f64> {
+        let f = &r.f;
+        match self {
+            AccMetric::DynSd => Some(f.dyn_sd as f64),
+            AccMetric::Vedba => Some(f.vedba as f64),
+            AccMetric::Wbf => f.wbf_hz.filter(|_| r.flight).map(|x| x as f64),
+            AccMetric::Pitch => Some(f.pitch_deg as f64),
+            AccMetric::Cluster => Some(r.cluster as f64 + 1.0),
+            AccMetric::Behaviour => r.behaviour.map(|b| b as f64 + 1.0),
+        }
+    }
+}
+
+/// Behaviour-cluster colours, calm (C1) → dynamic.
+const CLUSTER_COLORS: [Color32; 8] = [
+    Color32::from_rgb(69, 117, 180),
+    Color32::from_rgb(145, 191, 219),
+    Color32::from_rgb(171, 221, 164),
+    Color32::from_rgb(254, 224, 144),
+    Color32::from_rgb(252, 141, 89),
+    Color32::from_rgb(215, 48, 39),
+    Color32::from_rgb(118, 42, 131),
+    Color32::from_rgb(165, 0, 38),
+];
+
+/// Behaviour colours (Okabe–Ito), in the order of the annotated classes.
+const BEHAVIOUR_COLORS: [Color32; 8] = [
+    Color32::from_rgb(0, 114, 178),
+    Color32::from_rgb(230, 159, 0),
+    Color32::from_rgb(0, 158, 115),
+    Color32::from_rgb(204, 121, 167),
+    Color32::from_rgb(86, 180, 233),
+    Color32::from_rgb(213, 94, 0),
+    Color32::from_rgb(240, 228, 66),
+    Color32::from_rgb(160, 160, 160),
+];
+
+/// An acceleration file as loaded (kept to re-read with other settings / share by URL).
+struct AccFile {
+    name: String,
+    bytes: Vec<u8>,
+    origin: FileOrigin,
+}
+
+/// Burst features + per-fix summaries for the current sets, parameters and tracks.
+struct AccCache {
+    /// Sets + parameters (features and clusters).
+    key: u64,
+    a: crate::acc::Analysis,
+    /// … + tracks and assignments (per-fix summaries).
+    anno_key: u64,
+}
+
+impl ChartVar {
+    const ALL: [ChartVar; 33] = [
+        ChartVar::Sensor(SensorKind::Depth),
+        ChartVar::Ocean(OceanVar::DiveMax),
+        ChartVar::Ocean(OceanVar::DiveDuration),
+        ChartVar::Ocean(OceanVar::Seafloor),
+        ChartVar::Sensor(SensorKind::Temperature),
+        ChartVar::Ocean(OceanVar::Sst),
+        ChartVar::Ocean(OceanVar::WaveHeight),
+        ChartVar::Ocean(OceanVar::SwellHeight),
+        ChartVar::Ocean(OceanVar::WavePeriod),
+        ChartVar::Ocean(OceanVar::CurrentSpeed),
+        ChartVar::Ocean(OceanVar::CurrentSupport),
+        ChartVar::Ocean(OceanVar::SeaLevel),
+        ChartVar::Ocean(OceanVar::Wind10),
+        ChartVar::Ocean(OceanVar::Wind2),
+        ChartVar::WindSupport,
+        ChartVar::Era5Temp,
+        ChartVar::Precip,
+        ChartVar::GroundSpeed,
+        ChartVar::LocError,
+        ChartVar::Sensor(SensorKind::Light),
+        ChartVar::Sensor(SensorKind::Vedba),
+        ChartVar::Acc(AccMetric::DynSd),
+        ChartVar::Acc(AccMetric::Vedba),
+        ChartVar::Acc(AccMetric::Wbf),
+        ChartVar::Acc(AccMetric::Pitch),
+        ChartVar::Acc(AccMetric::Cluster),
+        ChartVar::Acc(AccMetric::Behaviour),
+        ChartVar::AccBurst,
+        ChartVar::Move(MoveMetric::Displacement),
+        ChartVar::Move(MoveMetric::Fpt),
+        ChartVar::Move(MoveMetric::Hmm),
+        ChartVar::Move(MoveMetric::Segment),
+        ChartVar::Altitude,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            ChartVar::Altitude => "GPS height (m)",
+            ChartVar::GroundSpeed => "Ground speed (m/s)",
+            ChartVar::WindSupport => "Wind along the heading at the fix (m/s)",
+            ChartVar::Era5Temp => "ERA5 2 m temperature (°C)",
+            ChartVar::Precip => "ERA5 precipitation (mm/h)",
+            ChartVar::LocError => "Location error (km)",
+            ChartVar::Sensor(k) => k.label(),
+            ChartVar::Curtain => "3D: time × height wind curtain along track",
+            ChartVar::Profile => "3D: wind profile at selected fix / cursor",
+            ChartVar::CloudBase => "Cloud base, LCL (m ASL) — with flight altitude",
+            ChartVar::Acc(m) => m.label(),
+            ChartVar::AccBurst => "ACC: burst at the cursor (waveform + spectrum)",
+            ChartVar::Move(m) => m.label(),
+            ChartVar::Ocean(o) => o.label(),
+        }
+    }
+    /// Plotted as values over time (can be a subplot).
+    fn is_series(self) -> bool {
+        !matches!(
+            self,
+            ChartVar::Curtain | ChartVar::Profile | ChartVar::AccBurst
+        )
+    }
+    fn of_fix(self, f: &Fix) -> Option<f32> {
+        match self {
+            ChartVar::Altitude => f.best_alt(),
+            ChartVar::GroundSpeed => f.step_significant.then_some(f.ground_speed_ms).flatten(),
+            ChartVar::WindSupport => f.weather.wind_support,
+            ChartVar::Era5Temp => f.weather.temp_2m,
+            ChartVar::Precip => f.weather.precipitation_mm,
+            ChartVar::LocError => f.error_m.map(|e| e / 1000.0),
+            ChartVar::CloudBase => f.weather.cloud_base_m,
+            ChartVar::Move(m) => m.of(f),
+            ChartVar::Ocean(o) => o.of(f).map(|v| match o {
+                // depths plot downward
+                OceanVar::Seafloor => v.min(0.0),
+                _ => v,
+            }),
+            ChartVar::Sensor(_)
+            | ChartVar::Curtain
+            | ChartVar::Profile
+            | ChartVar::Acc(_)
+            | ChartVar::AccBurst => None,
+        }
+    }
+}
+
+const PALETTE: [[u8; 3]; 10] = [
+    [230, 159, 0],
+    [86, 180, 233],
+    [0, 158, 115],
+    [240, 228, 66],
+    [213, 94, 0],
+    [204, 121, 167],
+    [0, 114, 178],
+    [255, 255, 255],
+    [170, 120, 255],
+    [120, 220, 120],
+];
+
+const SPEEDS: [(f64, &str); 6] = [
+    (600.0, "10 min/s"),
+    (3600.0, "1 h/s"),
+    (6.0 * 3600.0, "6 h/s"),
+    (86400.0, "1 day/s"),
+    (3.0 * 86400.0, "3 days/s"),
+    (7.0 * 86400.0, "1 week/s"),
+];
+
+pub struct FinApp {
+    tracks: Vec<Track>,
+    files: Vec<LoadedFile>,
+    log: Vec<String>,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+
+    // time
+    t_min: f64,
+    t_max: f64,
+    t_now: f64,
+    playing: bool,
+    speed_idx: usize,
+    trail_to_cursor: bool,
+
+    // map
+    memory: MapMemory,
+    basemap: Basemap,
+    base_tiles: HashMap<Basemap, HttpTiles>,
+    sat_on: bool,
+    sat_layer: SatLayer,
+    sat_opacity: f32,
+    sat_tiles: HashMap<(SatLayer, String), HttpTiles>,
+    /// Static ocean overlay (vessel density, wind farms, GEBCO) and its opacity.
+    overlay: Option<crate::tiles::Overlay>,
+    overlay_opacity: f32,
+    overlay_tiles: HashMap<crate::tiles::Overlay, HttpTiles>,
+    fit_pending: bool,
+    follow: bool,
+
+    // display
+    color_by: ColorBy,
+    show_error: bool,
+    show_wind_arrows: bool,
+    show_wind_field: bool,
+    wind_field_night_only: bool,
+    /// User's wind palette per basemap; missing → [`WindPalette::default_for`].
+    wind_palettes: HashMap<Basemap, WindPalette>,
+    skip_daytime: bool,
+    max_error_km: f32,
+    hide_insignificant: bool,
+    selected: Option<(usize, usize)>,
+    selected_track: Option<usize>,
+    /// Track whose date-range editor is open, with the From / To text.
+    date_edit: Option<usize>,
+    // weather layers & storms
+    wx_field: crate::wxfield::FieldVar,
+    wx_isobars: bool,
+    wx_centres: bool,
+    storms: Vec<crate::cyclones::Storm>,
+    storms_on: bool,
+    storms_busy: bool,
+    /// A shared link asked for cyclones: fetch once the tracks are in.
+    storms_fetch_pending: bool,
+    /// Year files still loading, how many arrived, storms collected, and the query
+    /// (t0, t1, south, north, west, east).
+    storms_years_left: usize,
+    storms_years_ok: usize,
+    storms_acc: Vec<crate::cyclones::Storm>,
+    storms_query: Option<(i64, i64, f64, f64, f64, f64)>,
+    // acceleration
+    acc_files: Vec<AccFile>,
+    acc_sets: Vec<crate::acc::AccSet>,
+    acc_params: crate::acc::Params,
+    /// Parameters being edited (applied with a button: analysis can take a moment).
+    acc_edit: crate::acc::Params,
+    acc_slope: Option<f64>,
+    acc_cache: Option<AccCache>,
+    /// FleaTag sets whose start was taken from the track's first fix.
+    acc_start_guessed: HashSet<String>,
+    acc_start_text: HashMap<String, String>,
+    // wind turbines & tall structures
+    st_on: bool,
+    st_params: crate::structures::Params,
+    st_highlight: bool,
+    st_store: crate::structures::StructureStore,
+    st_queue: VecDeque<Vec<crate::structures::Tile>>,
+    st_busy: bool,
+    st_server: usize,
+    st_retry: HashMap<Vec<crate::structures::Tile>, u8>,
+    st_next_at: f64,
+    st_planned: Option<u64>,
+    st_failed: usize,
+    st_cache: Option<StCache>,
+    date_from: String,
+    date_to: String,
+    chart_var: ChartVar,
+    /// Extra charts stacked under the main one (shared time axis).
+    chart_subplots: Vec<ChartVar>,
+    /// Time window (days) the user zoomed / panned the charts to; `None` = fit all plotted data.
+    chart_x_view: Option<[f64; 2]>,
+    /// Time span of everything plotted in the last frame (union over the stacked charts).
+    chart_full_x: Option<[f64; 2]>,
+    chart_full_x_acc: Option<[f64; 2]>,
+    /// On-demand movement analyses (side panel → Movement analysis).
+    mv_ui: movement_ui::MoveUi,
+    /// Ocean: Argos filters, dives, bathymetry, Open-Meteo Marine.
+    min_lc: ArgosLc,
+    speed_filter_ms: f32,
+    dive_params: crate::dives::DiveParams,
+    /// track key → (fingerprint, dives)
+    dive_cache: HashMap<String, (u64, Vec<crate::dives::Dive>)>,
+    show_dives: bool,
+    deep_only: bool,
+    /// Hours either side of the cursor whose dives the 3D view draws (0 = all).
+    dive_window_h: f32,
+    bathy: crate::terrain::Terrain,
+    bathy_pending: bool,
+    marine: crate::marine::MarineStore,
+    marine_queue: VecDeque<(crate::marine::Request, u8)>,
+    marine_inflight: usize,
+    marine_pause_until: f64,
+    marine_failed: usize,
+
+    // weather
+    store: WeatherStore,
+    opts: AnnotateOptions,
+    queue: VecDeque<Job>,
+    in_flight: HashMap<usize, Job>,
+    next_req_id: usize,
+    req_total: usize,
+    era5_source: Era5Source,
+    /// Copernicus CDS personal access token (kept in prefs, never in share links).
+    cds_key: String,
+    /// Optional Open-Meteo API key (customer servers, higher limits).
+    om_key: String,
+    show_keys: bool,
+    cds_pending: VecDeque<crate::cds::CellJob>,
+    cds_running: Vec<CdsRun>,
+    cds_next_id: u64,
+    /// Send time of each in-flight Open-Meteo request (for the timeout watchdog).
+    in_flight_t: HashMap<usize, f64>,
+    /// Why queued downloads are waiting, shown under the progress bar.
+    wait_note: Option<String>,
+    /// Open-Meteo refused with its daily limit: no more requests before this time.
+    om_blocked_until: f64,
+    /// Requests in parallel (drops to 1 while the service is overloaded).
+    om_parallel: usize,
+    om_ok_streak: u32,
+    /// Requests that kept failing transiently (not marked done; 'Retry failed').
+    failed_jobs: Vec<Job>,
+    req_done: usize,
+    req_failed: usize,
+    since_annotate: usize,
+
+    // 3D wind
+    view_tab: ViewTab,
+    // layout (phones / small windows)
+    narrow: bool,
+    side_open: bool,
+    chart_open: bool,
+    layout_init: bool,
+    profiles: ProfileStore,
+    om_model: OmModel,
+    field_auto: bool,
+    field_step_cells: i32,
+    /// (day, visible-tracks key) for which the 3D field around the animals was requested.
+    field_days_requested: HashSet<(i64, u64)>,
+    /// Radius (degrees) of the 3D wind field around each animal.
+    field_radius_deg: f32,
+    /// Same bookkeeping for the 2D (surface) wind field; active after the first Annotate.
+    surface_field_on: bool,
+    surface_field_days: HashSet<(i64, u64)>,
+    // Open-Meteo rate limiting: (time sent, weight) of recent requests, pause after HTTP 429.
+    sent_log: VecDeque<(f64, f32)>,
+    pause_until: f64,
+    now: f64,
+    retries: HashMap<String, u8>,
+    display_levels: Vec<usize>,
+    view3d: View3D,
+    slice_cache: Option<(SliceKey, Option<FieldSlice>)>,
+    curtain_metric: CurtainMetric,
+    curtain_cache: Option<(CurtainKey, Option<Curtain>)>,
+
+    // share links
+    share_dialog: bool,
+    share_embed: bool,
+    url_dialog: bool,
+    url_input: String,
+    /// A share link being restored: (state, files still downloading).
+    pending_share: Option<(ShareMap, usize)>,
+    /// Centre of the 2D map (lat, lon) as last drawn.
+    map_center: Option<(f64, f64)>,
+    /// Packed data files for links: (files key, base64url).
+    packed_cache: Option<(u64, String)>,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    last_hash: String,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    hash_synced_at: f64,
+
+    // video export
+    video: video::Settings,
+    video_dialog: bool,
+    ffmpeg: Option<bool>,
+    rec: Option<Recording>,
+    map_rect: Rect,
+    timeline_rect: Rect,
+}
+
+/// An in-progress video export (see [`crate::video`]).
+struct Recording {
+    sink: video::Sink,
+    shot_tx: Sender<Arc<ColorImage>>,
+    shot_rx: Receiver<Arc<ColorImage>>,
+    /// Capture area in points, fixed when recording starts.
+    rect: Rect,
+    downscale: usize,
+    t: f64,
+    t_end: f64,
+    dt: f64,
+    waiting: bool,
+    /// Frames to render before the first capture so map tiles can load.
+    warmup: u32,
+    frames: usize,
+    total: usize,
+    name: String,
+}
+
+type CurtainKey = (usize, u64, CurtainMetric, usize);
+type SliceKey = (i64, u64, Vec<usize>, (i32, i32, i32, i32));
+
+impl FinApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut app = Self::blank();
+        if let Some(link) = startup_link() {
+            app.start_from_share(&ShareMap::decode(&link));
+        } else if std::env::var("FINTRACK_DEMO").is_ok() {
+            app.load_demo();
+        }
+        app.apply_test_env();
+        app
+    }
+
+    /// App with default state and no data (also used by tests).
+    fn blank() -> Self {
+        let (tx, rx) = channel();
+        let mut app = FinApp {
+            tracks: Vec::new(),
+            files: Vec::new(),
+            log: vec!["Drop CSV files here or use Open… (try Load demo to explore).".into()],
+            tx,
+            rx,
+            t_min: 0.0,
+            t_max: 1.0,
+            t_now: 0.0,
+            playing: false,
+            speed_idx: 3,
+            trail_to_cursor: true,
+            memory: MapMemory::default(),
+            basemap: Basemap::EsriImagery,
+            base_tiles: HashMap::new(),
+            sat_on: false,
+            sat_layer: SatLayer::ModisTerra,
+            sat_opacity: 0.75,
+            sat_tiles: HashMap::new(),
+            overlay: None,
+            overlay_opacity: 0.75,
+            overlay_tiles: HashMap::new(),
+            fit_pending: false,
+            follow: false,
+            color_by: ColorBy::Individual,
+            show_error: true,
+            show_wind_arrows: false,
+            show_wind_field: true,
+            wind_field_night_only: false,
+            wind_palettes: HashMap::new(),
+            skip_daytime: false,
+            max_error_km: 25.0,
+            hide_insignificant: false,
+            selected: None,
+            selected_track: None,
+            date_edit: None,
+            wx_field: crate::wxfield::FieldVar::Off,
+            wx_isobars: false,
+            wx_centres: false,
+            storms: Vec::new(),
+            storms_on: true,
+            storms_busy: false,
+            storms_fetch_pending: false,
+            storms_years_left: 0,
+            storms_years_ok: 0,
+            storms_acc: Vec::new(),
+            storms_query: None,
+            acc_files: Vec::new(),
+            acc_sets: Vec::new(),
+            acc_params: crate::acc::Params::default(),
+            acc_edit: crate::acc::Params::default(),
+            acc_slope: None,
+            acc_cache: None,
+            acc_start_guessed: HashSet::new(),
+            acc_start_text: HashMap::new(),
+            st_on: false,
+            st_params: crate::structures::Params::default(),
+            st_highlight: true,
+            st_store: Default::default(),
+            st_queue: VecDeque::new(),
+            st_busy: false,
+            st_server: 0,
+            st_retry: HashMap::new(),
+            st_next_at: 0.0,
+            st_planned: None,
+            st_failed: 0,
+            st_cache: None,
+            date_from: String::new(),
+            date_to: String::new(),
+            chart_var: ChartVar::Altitude,
+            chart_subplots: Vec::new(),
+            chart_x_view: None,
+            chart_full_x: None,
+            chart_full_x_acc: None,
+            mv_ui: Default::default(),
+            min_lc: ArgosLc::B,
+            speed_filter_ms: 0.0,
+            dive_params: Default::default(),
+            dive_cache: HashMap::new(),
+            show_dives: true,
+            deep_only: false,
+            dive_window_h: 12.0,
+            bathy: Default::default(),
+            bathy_pending: false,
+            marine: Default::default(),
+            marine_queue: VecDeque::new(),
+            marine_inflight: 0,
+            marine_pause_until: 0.0,
+            marine_failed: 0,
+            store: WeatherStore::default(),
+            opts: AnnotateOptions::default(),
+            queue: VecDeque::new(),
+            in_flight: HashMap::new(),
+            next_req_id: 0,
+            req_total: 0,
+            req_done: 0,
+            req_failed: 0,
+            since_annotate: 0,
+            era5_source: match crate::prefs::load("era5_source").as_deref() {
+                Some("cds") => Era5Source::Cds,
+                _ => Era5Source::OpenMeteo,
+            },
+            cds_key: crate::prefs::load("cds_key").unwrap_or_default(),
+            om_key: crate::prefs::load("open_meteo_key").unwrap_or_default(),
+            show_keys: false,
+            cds_pending: VecDeque::new(),
+            cds_running: Vec::new(),
+            cds_next_id: 0,
+            in_flight_t: HashMap::new(),
+            wait_note: None,
+            om_blocked_until: 0.0,
+            om_parallel: OM_PARALLEL,
+            om_ok_streak: 0,
+            failed_jobs: Vec::new(),
+            share_dialog: false,
+            share_embed: true,
+            url_dialog: false,
+            url_input: String::new(),
+            pending_share: None,
+            map_center: None,
+            packed_cache: None,
+            last_hash: String::new(),
+            hash_synced_at: 0.0,
+            video: video::Settings::default(),
+            video_dialog: false,
+            ffmpeg: None,
+            rec: None,
+            map_rect: Rect::NOTHING,
+            timeline_rect: Rect::NOTHING,
+            view_tab: ViewTab::Map,
+            narrow: false,
+            side_open: true,
+            chart_open: true,
+            layout_init: false,
+            profiles: ProfileStore::default(),
+            om_model: OmModel::Gfs,
+            field_auto: true,
+            field_step_cells: 4,
+            field_days_requested: HashSet::new(),
+            field_radius_deg: 3.0,
+            surface_field_on: false,
+            surface_field_days: HashSet::new(),
+            sent_log: VecDeque::new(),
+            pause_until: 0.0,
+            now: 0.0,
+            retries: HashMap::new(),
+            display_levels: Vec::new(),
+            view3d: View3D::default(),
+            slice_cache: None,
+            curtain_metric: CurtainMetric::WindSupport,
+            curtain_cache: None,
+        };
+        let _ = app.memory.set_zoom(5.0);
+        app.memory.center_at(lon_lat(9.17, 47.67));
+        app
+    }
+
+    /// Offline testing aids (synthetic winds, 3D tab) from environment variables.
+    fn apply_test_env(&mut self) {
+        let app = self;
+        if std::env::var("FINTRACK_SYNTHETIC_WIND").is_ok() {
+            weather::synthetic_field(&mut app.store, &app.tracks);
+            let n = weather::annotate(&mut app.tracks, &app.store, &app.opts);
+            app.color_by = ColorBy::SegmentWind;
+            app.status(format!(
+                "SYNTHETIC test wind field loaded (not ERA5) - {n} fixes annotated"
+            ));
+            wind3d::synthetic_profiles(&mut app.profiles, &app.tracks);
+            app.reset_display_levels();
+            let n3 = wind3d::annotate(&mut app.tracks, &app.profiles);
+            app.status(format!(
+                "SYNTHETIC pressure-level winds (not real data) - {n3} fixes annotated"
+            ));
+            if let Ok(v) = std::env::var("FINTRACK_3D") {
+                app.view_tab = ViewTab::ThreeD;
+                app.chart_var = if v == "profile" {
+                    ChartVar::Profile
+                } else {
+                    ChartVar::Curtain
+                };
+                app.selected_track = Some(0);
+                if v == "profile" {
+                    app.t_now = app.t_min + 0.3 * (app.t_max - app.t_min);
+                }
+            }
+        }
+        // UI test of the dive views: `FINTRACK_DIVES=3d` (3D tab) or `=map`
+        if let Ok(v) = std::env::var("FINTRACK_DIVES")
+            && !app.tracks.is_empty()
+        {
+            app.selected_track = Some(0);
+            app.chart_var = ChartVar::Sensor(SensorKind::Depth);
+            app.chart_subplots = vec![ChartVar::Ocean(OceanVar::DiveMax)];
+            app.color_by = ColorBy::ArgosClass;
+            app.ensure_dives();
+            let key = app.track_key(0);
+            let (a0, b0) = app.tracks[0].time_range().unwrap_or((0, 0));
+            let mid = a0 as f64 + 0.4 * (b0 - a0) as f64;
+            // the deepest dive around 40 % of the first track
+            if let Some(d) = app.dive_cache.get(&key).and_then(|d| {
+                d.1.iter()
+                    .filter(|x| (x.t_max as f64 - mid).abs() < 6.0 * 3600.0)
+                    .max_by(|a, b| a.max_depth.total_cmp(&b.max_depth))
+                    .map(|x| (x.t_max + 60) as f64)
+            }) {
+                app.t_now = d;
+            }
+            if v == "3d" {
+                app.view_tab = ViewTab::ThreeD;
+                app.chart_var = ChartVar::Sensor(SensorKind::Depth);
+                // close to the animal, looking along the track
+                app.view3d.follow = true;
+                app.view3d.set_camera_after_fit(
+                    crate::view3d::Camera {
+                        yaw: 35.0,
+                        pitch: 22.0,
+                        dist: 45.0,
+                        ..Default::default()
+                    },
+                    Some(60.0),
+                    Some(false),
+                    None,
+                );
+            }
+        }
+        // UI test of the movement panel: analyses on the longest track
+        if std::env::var("FINTRACK_MOVE").is_ok() && !app.tracks.is_empty() {
+            app.run_movement_test_env();
+        }
+    }
+
+    fn status(&mut self, s: impl Into<String>) {
+        let s = s.into();
+        log::info!("{s}");
+        self.log.push(s);
+        if self.log.len() > 200 {
+            self.log.drain(0..100);
+        }
+    }
+
+    // ------------------------------------------------------------------ loading
+
+    fn load_demo(&mut self) {
+        for (name, csv) in crate::demo::all() {
+            self.add_file_from(
+                name.to_string(),
+                csv.into_bytes(),
+                None,
+                Some(FileOrigin::Demo),
+            );
+        }
+    }
+
+    fn add_file(&mut self, name: String, bytes: Vec<u8>, force: Option<&str>) {
+        self.add_file_from(name, bytes, force, None);
+    }
+
+    /// Load a file; `origin` None keeps the origin of a same-named file (re-parse) or Local.
+    fn add_file_from(
+        &mut self,
+        name: String,
+        bytes: Vec<u8>,
+        force: Option<&str>,
+        origin: Option<FileOrigin>,
+    ) {
+        let origin = origin
+            .or_else(|| {
+                self.files
+                    .iter()
+                    .find(|f| f.name == name)
+                    .map(|f| f.origin.clone())
+            })
+            .unwrap_or(FileOrigin::Local);
+        if crate::acc::sniff(&name, &bytes) {
+            return self.add_acc_file(name, bytes, origin);
+        }
+        let table = match Table::from_bytes(&name, &bytes) {
+            Ok(t) => t,
+            Err(e) => return self.status(format!("! {e}")),
+        };
+        let ranking = firmware::rank(&table);
+        match firmware::parse(&table, force) {
+            Ok((out, fw)) => {
+                self.tracks.retain(|t| t.file != name);
+                self.files.retain(|f| f.name != name);
+                let n_fix: usize = out.tracks.iter().map(|t| t.fixes.len()).sum();
+                self.status(format!(
+                    "Loaded {name}: {} track(s), {n_fix} fixes - {}",
+                    out.tracks.len(),
+                    firmware::label_for(fw)
+                ));
+                for w in out.warnings {
+                    self.status(format!("  {w}"));
+                }
+                for mut tr in out.tracks {
+                    tr.file = name.clone();
+                    tr.color = PALETTE[self.tracks.len() % PALETTE.len()];
+                    self.tracks.push(tr);
+                }
+                self.files.push(LoadedFile {
+                    name,
+                    bytes,
+                    firmware: fw.to_string(),
+                    forced: force.map(|f| f.to_string()),
+                    origin,
+                    ranking,
+                });
+                self.packed_cache = None;
+                self.recompute_time_range();
+                if !self.store.is_empty() {
+                    weather::annotate(&mut self.tracks, &self.store, &self.opts);
+                }
+                if !self.profiles.is_empty() {
+                    wind3d::annotate(&mut self.tracks, &self.profiles);
+                }
+                self.selected = None;
+                self.fit_pending = true;
+                self.view3d.request_fit();
+                self.curtain_cache = None;
+            }
+            Err(e) => self.status(format!("! {e}")),
+        }
+    }
+
+    // ------------------------------------------------------------------ share links
+
+    /// Changes whenever the set of loaded files changes (for the packed-data cache).
+    fn files_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for f in &self.files {
+            (
+                &f.name,
+                f.bytes.len(),
+                &f.forced,
+                f.origin == FileOrigin::Local,
+            )
+                .hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Local files packed for embedding in a link (cached).
+    fn packed_data(&mut self) -> String {
+        let key = self.files_key();
+        if let Some((k, s)) = &self.packed_cache
+            && *k == key
+        {
+            return s.clone();
+        }
+        let files: Vec<share::EmbeddedFile> = self
+            .files
+            .iter()
+            .filter(|f| f.origin == FileOrigin::Local)
+            .map(|f| share::EmbeddedFile {
+                name: f.name.clone(),
+                firmware: f.forced.clone().unwrap_or_default(),
+                bytes: f.bytes.clone(),
+            })
+            .collect();
+        let s = if files.is_empty() {
+            String::new()
+        } else {
+            share::pack_files(&files)
+        };
+        self.packed_cache = Some((key, s.clone()));
+        s
+    }
+
+    /// The whole dashboard as link parameters. `embed`: include local data files.
+    fn share_map(&mut self, embed: bool) -> ShareMap {
+        use share::{name, r};
+        let mut m = ShareMap::default();
+        m.set("v", share::VERSION);
+        // ---- data
+        if self.files.iter().any(|f| f.origin == FileOrigin::Demo) {
+            m.set("demo", "1");
+        }
+        let mut forced: Vec<String> = Vec::new();
+        for f in &self.files {
+            if let FileOrigin::Url(u) = &f.origin {
+                m.set("data", u);
+            }
+            if f.origin != FileOrigin::Local
+                && let Some(fw) = &f.forced
+            {
+                forced.push(format!("{}:{fw}", f.name));
+            }
+        }
+        for fw in forced {
+            m.set("fw", fw);
+        }
+        // acceleration files are re-fetched from their URL (local ones are not embedded:
+        // they can be hundreds of MB)
+        for f in &self.acc_files {
+            if let FileOrigin::Url(u) = &f.origin {
+                m.set("data", u);
+            }
+        }
+        if embed {
+            let packed = self.packed_data();
+            m.set_if(!packed.is_empty(), "emb", packed);
+        }
+        // ---- view
+        m.set(
+            "tab",
+            if self.view_tab == ViewTab::ThreeD {
+                "3d"
+            } else {
+                "map"
+            },
+        );
+        m.set("t", self.t_now.round() as i64);
+        m.set("spd", self.speed_idx);
+        if let Some((la, lo)) = self.map_center {
+            m.set(
+                "map",
+                format!("{},{},{}", r(la, 4), r(lo, 4), r(self.memory.zoom(), 2)),
+            );
+        }
+        m.set("base", name(&self.basemap));
+        m.set_if(
+            self.sat_on,
+            "sat",
+            format!(
+                "{},{}",
+                name(&self.sat_layer),
+                r(self.sat_opacity as f64, 2)
+            ),
+        );
+        if let Some(o) = self.overlay {
+            m.set(
+                "ov",
+                format!("{},{}", name(&o), r(self.overlay_opacity as f64, 2)),
+            );
+        }
+        if !self.wind_palettes.is_empty() {
+            let mut p: Vec<String> = self
+                .wind_palettes
+                .iter()
+                .map(|(b, w)| format!("{}:{}", name(b), name(w)))
+                .collect();
+            p.sort();
+            m.set("pal", p.join(";"));
+        }
+        m.set("cb", name(&self.color_by));
+        let flags = [
+            (self.show_error, 'e'),
+            (self.show_wind_arrows, 'a'),
+            (self.show_wind_field, 'w'),
+            (self.wind_field_night_only, 'n'),
+            (self.skip_daytime, 'd'),
+            (self.hide_insignificant, 'i'),
+            (self.trail_to_cursor, 'c'),
+            (self.follow, 'f'),
+            (self.view3d.follow, 'F'),
+        ];
+        m.set(
+            "disp",
+            flags
+                .iter()
+                .filter(|x| x.0)
+                .map(|x| x.1)
+                .collect::<String>(),
+        );
+        m.set("err", r(self.max_error_km as f64, 2));
+        m.set("chart", name(&self.chart_var));
+        m.set_if(
+            !self.chart_subplots.is_empty(),
+            "sub",
+            self.chart_subplots
+                .iter()
+                .map(name)
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+        m.set("cm", name(&self.curtain_metric));
+        m.set("co", self.chart_open as u8);
+        // ---- weather
+        let o = &self.opts;
+        m.set(
+            "wx",
+            format!(
+                "{},{},{},{},{},{},{}",
+                name(&o.model),
+                name(&o.level),
+                o.segments as u8,
+                o.night_only as u8,
+                r(o.max_segment_h as f64, 1),
+                r(o.field_margin_deg as f64, 2),
+                o.field_stride
+            ),
+        );
+        m.set_if(self.surface_field_on || !self.store.is_empty(), "era5", "1");
+        // ---- 3D
+        if let wind3d::Source::OpenMeteo(om) = self.profiles.source {
+            m.set("w3d", name(&om));
+            let annotated = self
+                .tracks
+                .iter()
+                .any(|t| t.fixes.iter().any(|f| f.weather.flight.is_some()));
+            m.set_if(annotated, "ann3d", "1");
+        }
+        m.set(
+            "f3d",
+            format!(
+                "{},{},{}",
+                self.field_auto as u8,
+                self.field_step_cells,
+                r(self.field_radius_deg as f64, 2)
+            ),
+        );
+        if !self.display_levels.is_empty() {
+            let lv: Vec<String> = self
+                .display_levels
+                .iter()
+                .filter_map(|&i| self.profiles.levels.get(i))
+                .map(|p| r(*p as f64, 0))
+                .collect();
+            m.set("lv", lv.join(","));
+        }
+        let v = &self.view3d;
+        m.set("rl", v.raster_level);
+        let c = &v.cam;
+        m.set(
+            "cam",
+            format!(
+                "{},{},{},{},{},{},{},{}{}",
+                r(c.yaw as f64, 1),
+                r(c.pitch as f64, 1),
+                r(c.dist as f64, 1),
+                r(c.target[0] as f64, 1),
+                r(c.target[1] as f64, 1),
+                r(c.target[2] as f64, 1),
+                r(v.exag as f64, 1),
+                v.auto_exag as u8,
+                v.origin()
+                    .map(|(la, lo)| format!(",{},{}", r(la, 5), r(lo, 5)))
+                    .unwrap_or_default()
+            ),
+        );
+        m.set(
+            "v3",
+            format!(
+                "{},{},{},{},{},{},{},{},{},{},{},{}",
+                v.particles_on as u8,
+                v.particles_per_level,
+                r(v.flow_hours_per_s as f64, 2),
+                v.show_planes as u8,
+                v.show_raster as u8,
+                v.show_drop_lines as u8,
+                v.show_shadows as u8,
+                r(v.ground_dim as f64, 2),
+                r(v.default_alt_m as f64, 0),
+                r(v.gap_factor as f64, 2),
+                v.terrain as u8,
+                v.show_clouds as u8
+            ),
+        );
+        // ---- tracks
+        let hidden: Vec<String> = (0..self.tracks.len())
+            .filter(|&i| !self.tracks[i].visible)
+            .map(|i| self.track_key(i))
+            .collect();
+        m.set_if(!hidden.is_empty(), "hide", hidden.join(","));
+        let ranges: Vec<String> = (0..self.tracks.len())
+            .filter_map(|i| {
+                let (a, b) = self.tracks[i].date_filter?;
+                Some(format!("{}:{a}-{b}", self.track_key(i)))
+            })
+            .collect();
+        m.set_if(!ranges.is_empty(), "dr", ranges.join(";"));
+        if self.wx_field != crate::wxfield::FieldVar::Off || self.wx_isobars || self.wx_centres {
+            m.set(
+                "wxl",
+                format!(
+                    "{},{},{}",
+                    name(&self.wx_field),
+                    self.wx_isobars as u8,
+                    self.wx_centres as u8
+                ),
+            );
+        }
+        m.set_if(self.storms_on && !self.storms.is_empty(), "tc", 1);
+        let ap = &self.acc_params;
+        if !self.acc_sets.is_empty() || *ap != crate::acc::Params::default() {
+            m.set(
+                "acc",
+                format!(
+                    "{},{},{},{},{},{},{}",
+                    r(ap.band.0 as f64, 2),
+                    r(ap.band.1 as f64, 2),
+                    r(ap.flight_g as f64, 3),
+                    r(ap.min_peak_frac as f64, 2),
+                    ap.k,
+                    r(ap.window_s as f64, 2),
+                    self.acc_slope
+                        .map(|x| format!("{x}"))
+                        .unwrap_or_else(|| "0".into())
+                ),
+            );
+        }
+        let accs: Vec<String> = self
+            .acc_sets
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}|{}|{}|{}",
+                    Self::acc_key(s),
+                    s.start_ms.map(|t| t.to_string()).unwrap_or_default(),
+                    r(s.clock_rate * 1e6, 0),
+                    s.track.clone().unwrap_or_default()
+                )
+            })
+            .collect();
+        m.set_if(!accs.is_empty(), "accs", accs.join(";"));
+        let sp = &self.st_params;
+        m.set_if(
+            self.st_on,
+            "st",
+            format!(
+                "{},{},{},{}",
+                r(sp.radius_m as f64, 0),
+                sp.include_other as u8,
+                r(sp.min_other_height_m as f64, 0),
+                self.st_highlight as u8
+            ),
+        );
+        m.set("oc", self.ocean_share());
+        let mvs = self.mv_share();
+        let mv_default = FinApp::mv_default_share();
+        m.set_if(mvs != mv_default, "mv", mvs);
+        let cols: Vec<String> = (0..self.tracks.len())
+            .map(|i| {
+                let c = self.tracks[i].color;
+                format!("{}:{:02x}{:02x}{:02x}", self.track_key(i), c[0], c[1], c[2])
+            })
+            .collect();
+        m.set_if(!cols.is_empty(), "col", cols.join(";"));
+        if let Some(i) = self.selected_track.filter(|&i| i < self.tracks.len()) {
+            m.set("iso", self.track_key(i));
+        }
+        if let Some((ti, fi)) = self.selected
+            && let Some(f) = self.tracks.get(ti).and_then(|t| t.fixes.get(fi))
+        {
+            m.set("sel", format!("{}:{}", self.track_key(ti), f.t));
+        }
+        m
+    }
+
+    /// Stable key of a track in links: its id, or `id@file` when the id occurs in several files.
+    fn track_key(&self, i: usize) -> String {
+        let t = &self.tracks[i];
+        if self.tracks.iter().filter(|o| o.id == t.id).count() > 1 {
+            format!("{}@{}", t.id, t.file)
+        } else {
+            t.id.clone()
+        }
+    }
+
+    fn track_by_key(&self, key: &str) -> Option<usize> {
+        (0..self.tracks.len()).find(|&i| self.track_key(i) == key)
+    }
+
+    /// Full link for the current view.
+    fn share_url(&mut self, embed: bool) -> String {
+        format!("{}#{}", page_base_url(), self.share_map(embed).encode())
+    }
+
+    /// Settings that don't depend on the data.
+    fn apply_share_settings(&mut self, m: &ShareMap) {
+        if let Some(v) = m.get("wxl") {
+            let p: Vec<&str> = v.split(',').collect();
+            if let Some(f) = p
+                .first()
+                .and_then(|f| from_name(&crate::wxfield::FieldVar::ALL, f))
+            {
+                self.wx_field = f;
+            }
+            self.wx_isobars = p.get(1) == Some(&"1");
+            self.wx_centres = p.get(2) == Some(&"1");
+        }
+        self.storms_fetch_pending = m.get("tc") == Some("1");
+        if let [lo, hi, fl, pk, k, win, slope, ..] = m.nums("acc")[..] {
+            self.acc_params = crate::acc::Params {
+                band: (lo as f32, hi as f32),
+                flight_g: fl as f32,
+                min_peak_frac: pk as f32,
+                k: (k as usize).min(8),
+                window_s: win as f32,
+                ..Default::default()
+            };
+            self.acc_edit = self.acc_params;
+            self.acc_slope = (slope > 0.0).then_some(slope);
+        }
+        self.mv_ui = Default::default();
+        self.mv_apply(&m.nums("mv"));
+        self.ocean_apply(&m.nums("oc"));
+        let stv = m.nums("st");
+        self.st_on = m.get("st").is_some();
+        if let [radius, other, minh, hl, ..] = stv[..] {
+            self.st_params.radius_m = (radius as f32).clamp(10.0, 50_000.0);
+            self.st_params.include_other = other != 0.0;
+            self.st_params.min_other_height_m = minh as f32;
+            self.st_highlight = hl != 0.0;
+        }
+        use share::from_name;
+        if let Some(t) = m.get("tab") {
+            self.view_tab = if t == "3d" {
+                ViewTab::ThreeD
+            } else {
+                ViewTab::Map
+            };
+        }
+        if let Some(v) = m.f64("spd") {
+            self.speed_idx = (v as usize).min(SPEEDS.len() - 1);
+        }
+        if let Some(b) = m.get("base").and_then(|b| from_name(&Basemap::ALL, b)) {
+            self.basemap = b;
+        }
+        self.sat_on = false;
+        if let Some(s) = m.get("sat") {
+            let mut it = s.split(',');
+            if let Some(l) = it.next().and_then(|l| from_name(&SatLayer::ALL, l)) {
+                self.sat_on = true;
+                self.sat_layer = l;
+            }
+            if let Some(o) = it.next().and_then(|o| o.parse::<f32>().ok()) {
+                self.sat_opacity = o.clamp(0.1, 1.0);
+            }
+        }
+        self.overlay = None;
+        if let Some(s) = m.get("ov") {
+            let mut it = s.split(',');
+            self.overlay = it
+                .next()
+                .and_then(|l| from_name(&crate::tiles::Overlay::ALL, l));
+            if let Some(o) = it.next().and_then(|o| o.parse::<f32>().ok()) {
+                self.overlay_opacity = o.clamp(0.1, 1.0);
+            }
+        }
+        if let Some(p) = m.get("pal") {
+            for kv in p.split(';') {
+                if let Some((b, w)) = kv.split_once(':')
+                    && let (Some(b), Some(w)) =
+                        (from_name(&Basemap::ALL, b), from_name(&WindPalette::ALL, w))
+                {
+                    self.wind_palettes.insert(b, w);
+                }
+            }
+        }
+        if let Some(c) = m.get("cb").and_then(|c| from_name(&ColorBy::ALL, c)) {
+            self.color_by = c;
+        }
+        if let Some(d) = m.get("disp") {
+            let has = |c: char| d.contains(c);
+            self.show_error = has('e');
+            self.show_wind_arrows = has('a');
+            self.show_wind_field = has('w');
+            self.wind_field_night_only = has('n');
+            self.skip_daytime = has('d');
+            self.hide_insignificant = has('i');
+            self.trail_to_cursor = has('c');
+            self.follow = has('f');
+            self.view3d.follow = has('F');
+        }
+        if let Some(e) = m.f64("err") {
+            self.max_error_km = e as f32;
+        }
+        if let Some(c) = m.get("chart").and_then(|c| from_name(&ChartVar::ALL, c)) {
+            self.chart_var = c;
+        }
+        self.chart_subplots = m
+            .get("sub")
+            .map(|v| {
+                v.split(';')
+                    .filter_map(|c| from_name(&ChartVar::ALL, c))
+                    .filter(|c| c.is_series())
+                    .take(4)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(c) = m.get("cm").and_then(|c| from_name(&CurtainMetric::ALL, c)) {
+            self.curtain_metric = c;
+        }
+        if let Some(c) = m.flag("co") {
+            self.chart_open = c;
+        }
+        if let Some(w) = m.get("wx") {
+            let p: Vec<&str> = w.split(',').collect();
+            let num = |i: usize| p.get(i).and_then(|v| v.parse::<f32>().ok());
+            if let Some(v) = p
+                .first()
+                .and_then(|v| from_name(&[Model::Era5, Model::BestMatch], v))
+            {
+                self.opts.model = v;
+            }
+            if let Some(v) = p
+                .get(1)
+                .and_then(|v| from_name(&[WindLevel::Auto, WindLevel::M10, WindLevel::M100], v))
+            {
+                self.opts.level = v;
+            }
+            if let Some(v) = num(2) {
+                self.opts.segments = v != 0.0;
+            }
+            if let Some(v) = num(3) {
+                self.opts.night_only = v != 0.0;
+            }
+            if let Some(v) = num(4) {
+                self.opts.max_segment_h = v;
+            }
+            if let Some(v) = num(5) {
+                self.opts.field_margin_deg = v;
+            }
+            if let Some(v) = num(6) {
+                self.opts.field_stride = (v as i32).max(1);
+            }
+        }
+        let f3 = m.nums("f3d");
+        if let Some(&a) = f3.first() {
+            self.field_auto = a != 0.0;
+        }
+        if let Some(&st) = f3.get(1).filter(|v| v.is_finite()) {
+            self.field_step_cells = (st as i32).clamp(1, 8);
+            self.profiles.node_step = self.field_step_cells;
+        }
+        if let Some(&rad) = f3.get(2).filter(|v| v.is_finite()) {
+            self.field_radius_deg = rad as f32;
+        }
+        if let Some(om) = m.get("w3d").and_then(|o| from_name(&OmModel::ALL, o)) {
+            self.om_model = om;
+        }
+        let v3 = m.nums("v3");
+        let g = |i: usize| v3.get(i).copied().filter(|v| v.is_finite());
+        let v = &mut self.view3d;
+        if let Some(x) = g(0) {
+            v.particles_on = x != 0.0;
+        }
+        if let Some(x) = g(1) {
+            v.particles_per_level = (x as usize).clamp(100, 2500);
+        }
+        if let Some(x) = g(2) {
+            v.flow_hours_per_s = x as f32;
+        }
+        if let Some(x) = g(3) {
+            v.show_planes = x != 0.0;
+        }
+        if let Some(x) = g(4) {
+            v.show_raster = x != 0.0;
+        }
+        if let Some(x) = g(5) {
+            v.show_drop_lines = x != 0.0;
+        }
+        if let Some(x) = g(6) {
+            v.show_shadows = x != 0.0;
+        }
+        if let Some(x) = g(7) {
+            v.ground_dim = x as f32;
+        }
+        if let Some(x) = g(8) {
+            v.default_alt_m = x as f32;
+        }
+        if let Some(x) = g(9) {
+            v.gap_factor = x as f32;
+        }
+        v.terrain = g(10).is_some_and(|x| x != 0.0);
+        v.show_clouds = g(11).is_some_and(|x| x != 0.0);
+        if let Some(x) = m.f64("rl") {
+            v.raster_level = x as usize;
+        }
+    }
+
+    /// Track-dependent state, applied once the link's data has loaded.
+    fn apply_share_view(&mut self, m: &ShareMap) {
+        if let Some(v) = m.get("accs") {
+            for e in v.split(';') {
+                let p: Vec<&str> = e.split('|').collect();
+                if p.len() < 4 {
+                    continue;
+                }
+                if let Some(s) = self.acc_sets.iter_mut().find(|s| Self::acc_key(s) == p[0]) {
+                    s.start_ms = p[1].parse().ok();
+                    s.clock_rate = p[2].parse::<f64>().unwrap_or(0.0) / 1e6;
+                    s.track = Some(p[3].to_string()).filter(|t| !t.is_empty());
+                    if s.start_ms.is_some() {
+                        let k = Self::acc_key(s);
+                        self.acc_start_guessed.remove(&k);
+                        self.acc_start_text.remove(&k);
+                    }
+                }
+            }
+            self.acc_cache = None;
+        }
+        // Date filters first: the selected fix below is looked up in the filtered fixes.
+        let mut changed = Vec::new();
+        let wanted: HashMap<usize, (i64, i64)> = m
+            .get("dr")
+            .map(|d| {
+                d.split(';')
+                    .filter_map(|kv| {
+                        let (key, r) = kv.rsplit_once(':')?;
+                        let (a, b) = r.split_once('-')?;
+                        Some((self.track_by_key(key)?, (a.parse().ok()?, b.parse().ok()?)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for i in 0..self.tracks.len() {
+            let want = wanted.get(&i).copied();
+            if self.tracks[i].date_filter != want {
+                self.tracks[i].set_date_filter(want);
+                changed.push(i);
+            }
+        }
+        if !changed.is_empty() {
+            self.recompute_time_range();
+            self.curtain_cache = None;
+        }
+        if let Some(h) = m.get("hide") {
+            let hidden: Vec<&str> = h.split(',').collect();
+            for i in 0..self.tracks.len() {
+                let key = self.track_key(i);
+                self.tracks[i].visible = !hidden.contains(&key.as_str());
+            }
+        }
+        if let Some(c) = m.get("col") {
+            for kv in c.split(';') {
+                if let Some((key, hex)) = kv.rsplit_once(':')
+                    && hex.len() == 6
+                    && let Ok(v) = u32::from_str_radix(hex, 16)
+                    && let Some(i) = self.track_by_key(key)
+                {
+                    self.tracks[i].color = [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+                }
+            }
+        }
+        self.selected_track = m.get("iso").and_then(|k| self.track_by_key(k));
+        self.selected = m.get("sel").and_then(|s| {
+            let (key, t) = s.rsplit_once(':')?;
+            let t: i64 = t.parse().ok()?;
+            let ti = self.track_by_key(key)?;
+            let fi = self.tracks[ti].fixes.iter().position(|f| f.t == t)?;
+            Some((ti, fi))
+        });
+        if let Some(t) = m.f64("t") {
+            self.t_now = t.clamp(self.t_min, self.t_max);
+        }
+        let mp = m.nums("map");
+        if mp.len() == 3 && mp.iter().all(|v| v.is_finite()) {
+            let _ = self.memory.set_zoom(mp[2]);
+            self.memory.center_at(lon_lat(mp[1], mp[0]));
+            self.fit_pending = false;
+        }
+        let c = m.nums("cam");
+        if c.len() >= 6 && c[..6].iter().all(|v| v.is_finite()) {
+            let cam = crate::view3d::Camera {
+                yaw: c[0] as f32,
+                pitch: c[1] as f32,
+                dist: c[2] as f32,
+                target: [c[3] as f32, c[4] as f32, c[5] as f32],
+                ..Default::default()
+            };
+            let exag = c
+                .get(6)
+                .copied()
+                .filter(|v| v.is_finite())
+                .map(|v| v as f32);
+            let auto = c.get(7).map(|v| *v != 0.0);
+            let origin = match (c.get(8), c.get(9)) {
+                (Some(la), Some(lo)) if la.is_finite() && lo.is_finite() => Some((*la, *lo)),
+                _ => None,
+            };
+            self.view3d.set_camera_after_fit(cam, exag, auto, origin);
+        }
+        // Weather: re-download what the sender had.
+        if m.flag("era5") == Some(true) {
+            self.start_weather();
+        }
+        if m.get("w3d").is_some() {
+            self.ensure_open_meteo();
+            if let Some(lv) = m.get("lv") {
+                let want: Vec<f32> = lv.split(',').filter_map(|x| x.parse().ok()).collect();
+                let idx: Vec<usize> = (0..self.profiles.levels.len())
+                    .filter(|&i| {
+                        want.iter()
+                            .any(|w| (w - self.profiles.levels[i]).abs() < 0.5)
+                    })
+                    .collect();
+                if !idx.is_empty() {
+                    self.display_levels = idx;
+                    self.slice_cache = None;
+                }
+            }
+            if m.flag("ann3d") == Some(true) {
+                self.start_profiles();
+            }
+        }
+        if let Some(x) = m.f64("rl") {
+            self.view3d.raster_level = x as usize;
+        }
+        self.status("Opened a shared view");
+    }
+
+    /// Restore a shared link: settings now, data (demo / embedded / URLs), then the view.
+    fn start_from_share(&mut self, m: &ShareMap) {
+        self.apply_share_settings(m);
+        let forced: HashMap<String, String> = m
+            .get_all("fw")
+            .filter_map(|s| s.rsplit_once(':'))
+            .map(|(n, f)| (n.to_string(), f.to_string()))
+            .collect();
+        if m.flag("demo") == Some(true) {
+            for (name, csv) in crate::demo::all() {
+                let fw = forced.get(name).map(|s| s.as_str());
+                self.add_file_from(
+                    name.to_string(),
+                    csv.into_bytes(),
+                    fw,
+                    Some(FileOrigin::Demo),
+                );
+            }
+        }
+        if let Some(e) = m.get("emb") {
+            match share::unpack_files(e) {
+                Ok(files) => {
+                    for f in files {
+                        let fw = (!f.firmware.is_empty()).then_some(f.firmware.as_str());
+                        self.add_file_from(
+                            f.name.clone(),
+                            f.bytes.clone(),
+                            fw,
+                            Some(FileOrigin::Local),
+                        );
+                    }
+                }
+                Err(err) => self.status(format!("! shared link: {err}")),
+            }
+        }
+        let urls: Vec<String> = m.get_all("data").map(|s| s.to_string()).collect();
+        for u in &urls {
+            let fw = forced.get(&share::file_name_from_url(u)).cloned();
+            self.fetch_url(u.clone(), fw, true);
+        }
+        if urls.is_empty() {
+            self.apply_share_view(m);
+        } else {
+            self.status(format!(
+                "Shared link: downloading {} data file(s)…",
+                urls.len()
+            ));
+            self.pending_share = Some((m.clone(), urls.len()));
+        }
+    }
+
+    fn share_file_arrived(&mut self) {
+        if let Some((_, n)) = &mut self.pending_share {
+            *n = n.saturating_sub(1);
+            if *n == 0
+                && let Some((m, _)) = self.pending_share.take()
+            {
+                self.apply_share_view(&m);
+            }
+        }
+    }
+
+    /// Download a CSV from a URL into the app.
+    fn fetch_url(&self, url: String, force: Option<String>, from_share: bool) {
+        // Dropbox / GitHub page links → direct downloads (also fixes older shared links).
+        let url = share::direct_download_url(&url);
+        let tx = self.tx.clone();
+        ehttp::fetch(ehttp::Request::get(&url), move |res| {
+            let msg = match res {
+                Ok(r) if r.ok && share::looks_like_html(&r.bytes) => Msg::FetchFailed {
+                    url,
+                    err: "got a web page instead of a CSV - use a direct download link \
+                          (Dropbox and GitHub page links are converted automatically; \
+                          Google Drive and OneDrive share links can't be read by browsers)"
+                        .into(),
+                    from_share,
+                },
+                Ok(r) if r.ok => Msg::RemoteFile {
+                    url,
+                    bytes: r.bytes,
+                    force,
+                    from_share,
+                },
+                Ok(r) => Msg::FetchFailed {
+                    url,
+                    err: format!("HTTP {} {}", r.status, r.status_text),
+                    from_share,
+                },
+                Err(e) => Msg::FetchFailed {
+                    url,
+                    err: format!(
+                        "{e} (the server may not allow downloads from other sites - CORS)"
+                    ),
+                    from_share,
+                },
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// Keep the browser's address bar in sync with the view (like a map app), at most once a second.
+    fn sync_url_hash(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.pending_share.is_some()
+                || self.tracks.is_empty()
+                || self.now - self.hash_synced_at < 1.0
+            {
+                return;
+            }
+            self.hash_synced_at = self.now;
+            // Embed data in the live address only while it stays short enough for every browser.
+            let embed = self.packed_data().len() <= 60_000;
+            let frag = self.share_map(embed).encode();
+            if frag != self.last_hash {
+                if let Some(h) = web_sys::window().and_then(|w| w.history().ok()) {
+                    let _ = h.replace_state_with_url(
+                        &wasm_bindgen::JsValue::NULL,
+                        "",
+                        Some(&format!("#{frag}")),
+                    );
+                }
+                self.last_hash = frag;
+            }
+        }
+    }
+
+    fn share_window(&mut self, ctx: &egui::Context) {
+        if !self.share_dialog {
+            return;
+        }
+        let has_local = self.files.iter().any(|f| f.origin == FileOrigin::Local);
+        let has_url = self
+            .files
+            .iter()
+            .any(|f| matches!(f.origin, FileOrigin::Url(_)));
+        let packed_len = if has_local {
+            self.packed_data().len()
+        } else {
+            0
+        };
+        let embed = self.share_embed && has_local;
+        let url = self.share_url(embed);
+        let cube = matches!(
+            self.profiles.source,
+            wind3d::Source::File(_) | wind3d::Source::Synthetic
+        );
+        let mut open = true;
+        let mut copied = false;
+        egui::Window::new("Share this view")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Anyone opening this link sees the same data, time, map or 3D view and settings. \
+                     Weather is downloaded again on their side.",
+                );
+                if has_local {
+                    ui.checkbox(
+                        &mut self.share_embed,
+                        format!("Include my data files in the link ({:.0} KB)", packed_len as f32 / 1024.0),
+                    );
+                    if !self.share_embed {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 180, 80),
+                            "Without the data the link only restores the view for people who open the same files.",
+                        );
+                    } else if packed_len > 60_000 {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 180, 80),
+                            "Long link: fine in browsers and email, but some chat apps cut long links. \
+                             Put the CSV online (e.g. GitHub) and use File → Open URL… for a short link.",
+                        );
+                    }
+                }
+                if has_url {
+                    ui.weak("Files opened from a web address are referenced, not copied into the link.");
+                }
+                if cube {
+                    ui.weak("The imported ERA5 cube / test field is not included; the link uses Open-Meteo winds.");
+                }
+                let mut text = url.as_str();
+                ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Copy link").clicked() {
+                        ui.ctx().copy_text(url.clone());
+                        copied = true;
+                    }
+                    ui.weak(format!("{} characters", url.len()));
+                });
+            });
+        if copied {
+            self.status("Share link copied to the clipboard");
+        }
+        self.share_dialog = open;
+    }
+
+    fn url_window(&mut self, ctx: &egui::Context) {
+        if !self.url_dialog {
+            return;
+        }
+        let mut open = true;
+        let mut go = false;
+        egui::Window::new("Open CSV from a web address")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label("Link to a CSV file: a Dropbox share link (\"Copy link\"), a GitHub file, or any direct download address.");
+                let r = ui.add(egui::TextEdit::singleline(&mut self.url_input).desired_width(f32::INFINITY));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = true;
+                }
+                ui.weak("Dropbox and GitHub links work as copied. Other servers must allow downloads from other sites (CORS); Google Drive and OneDrive share links don't.");
+                if ui.button("Load").clicked() {
+                    go = true;
+                }
+            });
+        let url = self.url_input.trim().to_string();
+        if go && url.starts_with("http") {
+            self.status(format!("Downloading {url}…"));
+            self.fetch_url(url, None, false);
+            open = false;
+        }
+        self.url_dialog = open;
+    }
+
+    /// Restrict tracks `idxs` to `range` (or restore all data), keeping the time cursor.
+    fn set_date_filter(&mut self, idxs: &[usize], range: Option<(i64, i64)>) {
+        for &i in idxs {
+            self.tracks[i].set_date_filter(range);
+            let tr = &mut self.tracks[i];
+            for f in tr.fixes.iter_mut().chain(tr.excluded_fixes.iter_mut()) {
+                f.mv = None;
+            }
+        }
+        let t = self.t_now;
+        self.recompute_time_range();
+        self.t_now = t.clamp(self.t_min, self.t_max);
+        self.selected = None; // fix indices changed
+        self.curtain_cache = None;
+    }
+
+    fn recompute_time_range(&mut self) {
+        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+        for tr in &self.tracks {
+            if let Some((a, b)) = tr.time_range() {
+                lo = lo.min(a);
+                hi = hi.max(b);
+            }
+        }
+        if lo <= hi {
+            self.t_min = lo as f64;
+            self.t_max = hi.max(lo + 1) as f64;
+            self.t_now = self.t_max;
+        }
+    }
+
+    fn open_dialog(&self, ctx: &egui::Context) {
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            if let Some(paths) = rfd::FileDialog::new()
+                .add_filter("Tracking & acceleration data", &["csv", "txt", "tsv", "gz"])
+                .pick_files()
+            {
+                for p in paths {
+                    let name = p
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    match std::fs::read(&p) {
+                        Ok(bytes) => {
+                            let _ = tx.send(Msg::File { name, bytes });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Status(format!("! {}: {e}", p.display())));
+                        }
+                    }
+                }
+                ctx.request_repaint();
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(files) = rfd::AsyncFileDialog::new()
+                .add_filter("Tracking & acceleration data", &["csv", "txt", "tsv", "gz"])
+                .pick_files()
+                .await
+            {
+                for f in files {
+                    let bytes = f.read().await;
+                    let _ = tx.send(Msg::File {
+                        name: f.file_name(),
+                        bytes,
+                    });
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+        for h in dropped {
+            let name = h
+                .path()
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "dropped.csv".into());
+            #[cfg(not(target_arch = "wasm32"))]
+            match h.bytes() {
+                Ok(bytes) => self.add_file(name, bytes, None),
+                Err(e) => self.status(format!("! {name}: {e}")),
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let tx = self.tx.clone();
+                let ctx = ctx.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match h.bytes_async().await {
+                        Ok(bytes) => {
+                            let _ = tx.send(Msg::File { name, bytes });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Status(format!("! {name}: {e}")));
+                        }
+                    }
+                    ctx.request_repaint();
+                });
+            }
+        }
+    }
+
+    fn export(&mut self) {
+        let mut tracks: Vec<Track> = Vec::new();
+        for (ti, tr) in self.tracks.iter().enumerate().filter(|(_, t)| t.visible) {
+            let mut tr = tr.clone();
+            if !self.storms.is_empty() {
+                for f in tr.fixes.iter_mut() {
+                    let near = crate::cyclones::nearest(&self.storms, f.lat, f.lon, f.t, 1500.0);
+                    let (name, d, w, c) = match &near {
+                        Some((i, d, p)) => (
+                            self.storms[*i].label(),
+                            format!("{d:.0}"),
+                            p.wind_kt.map(|w| format!("{w:.0}")).unwrap_or_default(),
+                            crate::cyclones::category(p.sshs, p.wind_kt, &p.nature).0,
+                        ),
+                        None => Default::default(),
+                    };
+                    f.extra.push(("tc_name".into(), name));
+                    f.extra.push(("tc_distance_km".into(), d));
+                    f.extra.push(("tc_wind_kt".into(), w));
+                    f.extra.push(("tc_category".into(), c));
+                }
+            }
+            if let Some(ac) = &self.acc_cache {
+                let k = self.acc_params.k;
+                let classes = ac.a.classes.clone();
+                for f in tr.fixes.iter_mut() {
+                    let a = f.acc.as_deref();
+                    let o = |v: Option<f32>, d: usize| {
+                        v.map(|x| format!("{x:.d$}")).unwrap_or_default()
+                    };
+                    f.extra.push((
+                        "acc_n_bursts".into(),
+                        a.map(|a| a.n.to_string()).unwrap_or_default(),
+                    ));
+                    f.extra
+                        .push(("acc_flight_frac".into(), o(a.map(|a| a.flight_frac), 3)));
+                    f.extra
+                        .push(("acc_dyn_sd_g".into(), o(a.map(|a| a.dyn_sd), 4)));
+                    f.extra
+                        .push(("acc_vedba_g".into(), o(a.map(|a| a.vedba), 4)));
+                    f.extra
+                        .push(("acc_wbf_hz".into(), o(a.and_then(|a| a.wbf_hz), 2)));
+                    f.extra
+                        .push(("acc_pitch_deg".into(), o(a.map(|a| a.pitch_deg), 1)));
+                    if !classes.is_empty() {
+                        f.extra.push((
+                            "acc_behaviour".into(),
+                            a.and_then(|a| a.behaviour)
+                                .and_then(|b| classes.get(b).cloned())
+                                .unwrap_or_default(),
+                        ));
+                        for (bi, name) in classes.iter().enumerate() {
+                            f.extra.push((
+                                format!("acc_frac_{name}"),
+                                o(a.and_then(|a| a.behaviour_frac.get(bi).copied()), 3),
+                            ));
+                        }
+                    }
+                    if k >= 2 {
+                        f.extra.push((
+                            "acc_cluster".into(),
+                            a.and_then(|a| a.cluster)
+                                .map(|c| format!("C{}", c + 1))
+                                .unwrap_or_default(),
+                        ));
+                        for c in 0..k {
+                            f.extra.push((
+                                format!("acc_frac_C{}", c + 1),
+                                o(a.and_then(|a| a.cluster_frac.get(c).copied()), 3),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(c) = self.st_cache.as_ref().filter(|_| self.st_on) {
+                let r = format!("{:.0}", c.a.params.radius_m);
+                for (fi, f) in tr.fixes.iter_mut().enumerate() {
+                    let (nt, no, near) =
+                        c.a.per_fix.get(&(ti, fi)).copied().unwrap_or((0, 0, None));
+                    f.extra.push(("structure_radius_m".into(), r.clone()));
+                    f.extra
+                        .push(("turbines_within_radius".into(), nt.to_string()));
+                    f.extra
+                        .push(("other_structures_within_radius".into(), no.to_string()));
+                    f.extra.push((
+                        "nearest_turbine_m".into(),
+                        near.map(|d| format!("{d:.0}")).unwrap_or_default(),
+                    ));
+                }
+            }
+            tracks.push(tr);
+        }
+        let csv = crate::export::to_csv(tracks.iter());
+        self.save_csv("fintrack_annotated.csv", csv);
+    }
+
+    /// Save a CSV (file dialog on desktop, download in the browser).
+    fn save_csv(&mut self, name: &str, csv: String) {
+        let name = name.to_string();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_file_name(name)
+                    .add_filter("CSV", &["csv"])
+                    .save_file()
+                {
+                    let msg = match std::fs::write(&p, csv) {
+                        Ok(_) => format!("Exported {}", p.display()),
+                        Err(e) => format!("! export failed: {e}"),
+                    };
+                    let _ = tx.send(Msg::Status(msg));
+                }
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let msg = match web_download(&name, csv.as_bytes(), "text/csv") {
+                Ok(()) => format!("Downloaded {name}"),
+                Err(e) => format!("! download failed: {e}"),
+            };
+            self.status(msg);
+        }
+    }
+
+    // ------------------------------------------------------------------ acceleration
+
+    fn acc_read_opts(&self) -> crate::acc::ReadOptions {
+        crate::acc::ReadOptions {
+            eobs_slope: self.acc_slope,
+            window_s: self.acc_params.window_s as f64,
+        }
+    }
+
+    fn acc_key(s: &crate::acc::AccSet) -> String {
+        format!("{}@{}", s.id, s.file)
+    }
+
+    fn add_acc_file(&mut self, name: String, bytes: Vec<u8>, origin: FileOrigin) {
+        match crate::acc::read(&name, &bytes, &self.acc_read_opts()) {
+            Ok(sets) => {
+                let n: usize = sets.iter().map(|s| s.bursts.len()).sum();
+                let ids: Vec<String> = sets.iter().map(|s| s.id.clone()).collect();
+                let fmt = sets[0].format.label();
+                self.acc_sets.retain(|s| s.file != name);
+                self.acc_sets.extend(sets);
+                self.acc_files.retain(|f| f.name != name);
+                self.add_acc_locations(&name, &bytes);
+                self.acc_files.push(AccFile {
+                    name: name.clone(),
+                    bytes,
+                    origin,
+                });
+                self.acc_cache = None;
+                self.status(format!(
+                    "Loaded acceleration {name} ({fmt}): {} animal(s) [{}], {n} bursts / windows",
+                    ids.len(),
+                    ids.join(", ")
+                ));
+            }
+            Err(e) => self.status(format!("! {name}: {e}")),
+        }
+    }
+
+    /// Location rows inside an ACC file (Firetail / Movebank exports mix `gps` and `acc`
+    /// rows) become a track named like the ACC set, so the two match.
+    fn add_acc_locations(&mut self, name: &str, bytes: &[u8]) {
+        let Ok(mut t) = Table::from_bytes(name, bytes) else {
+            return;
+        };
+        let (Some(cla), Some(clo)) = (
+            t.col(&["location_lat", "lat", "latitude"]),
+            t.col(&["location_long", "location_lon", "lon", "longitude"]),
+        ) else {
+            return;
+        };
+        t.rows.retain(|r| {
+            crate::table::parse_num(t_get(r, cla)).is_some()
+                && crate::table::parse_num(t_get(r, clo)).is_some()
+        });
+        if t.rows.len() < 2 {
+            return;
+        }
+        let Ok((out, fw)) = firmware::parse(&t, Some("generic")) else {
+            return;
+        };
+        self.tracks.retain(|tr| tr.file != name);
+        let single = out.tracks.len() == 1;
+        let n: usize = out.tracks.iter().map(|t| t.fixes.len()).sum();
+        for mut tr in out.tracks {
+            if single || tr.id.trim().is_empty() || tr.id == "0" {
+                tr.id = crate::acc::id_from_name(name);
+            }
+            tr.file = name.to_string();
+            tr.color = PALETTE[self.tracks.len() % PALETTE.len()];
+            self.tracks.push(tr);
+        }
+        self.recompute_time_range();
+        self.fit_pending = true;
+        self.view3d.request_fit();
+        self.status(format!(
+            "  {name}: {n} location fixes in the ACC file → track ({})",
+            firmware::label_for(fw)
+        ));
+    }
+
+    /// Re-read every ACC file (window length or e-obs slope changed), keeping each set's
+    /// track, start time and clock rate.
+    fn reread_acc(&mut self) {
+        let keep: HashMap<String, (Option<String>, Option<i64>, f64)> = self
+            .acc_sets
+            .iter()
+            .map(|s| {
+                (
+                    Self::acc_key(s),
+                    (s.track.clone(), s.start_ms, s.clock_rate),
+                )
+            })
+            .collect();
+        let opts = self.acc_read_opts();
+        let mut sets = Vec::new();
+        for f in &self.acc_files {
+            if let Ok(v) = crate::acc::read(&f.name, &f.bytes, &opts) {
+                sets.extend(v);
+            }
+        }
+        for s in &mut sets {
+            if let Some((t, st, cr)) = keep.get(&Self::acc_key(s)) {
+                s.track = t.clone();
+                s.start_ms = *st;
+                s.clock_rate = *cr;
+            }
+        }
+        self.acc_sets = sets;
+        self.acc_cache = None;
+    }
+
+    /// Track for an ACC id: exact match on the track id or tag, else one containing the other.
+    fn match_acc_track(&self, id: &str) -> Option<usize> {
+        let norm = |s: &str| {
+            s.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_lowercase()
+        };
+        let a = norm(id);
+        if a.is_empty() {
+            return None;
+        }
+        let ids: Vec<String> = self.tracks.iter().map(|t| norm(&t.id)).collect();
+        ids.iter().position(|t| *t == a).or_else(|| {
+            ids.iter().position(|t| {
+                (a.len() >= 4 && t.contains(&a)) || (t.len() >= 4 && a.contains(t.as_str()))
+            })
+        })
+    }
+
+    /// Match sets to tracks, anchor FleaTag clocks, compute features and annotate fixes.
+    fn ensure_acc_cache(&mut self) {
+        if self.acc_sets.is_empty() {
+            if self.acc_cache.take().is_some() {
+                for tr in &mut self.tracks {
+                    tr.fixes.iter_mut().for_each(|f| f.acc = None);
+                }
+            }
+            return;
+        }
+        // auto-match unassigned sets once tracks exist
+        for i in 0..self.acc_sets.len() {
+            if self.acc_sets[i].track.is_none()
+                && let Some(ti) = self.match_acc_track(&self.acc_sets[i].id)
+            {
+                self.acc_sets[i].track = Some(self.track_key(ti));
+            }
+            // FleaTag without a start: the track's first fix, flagged
+            let s = &self.acc_sets[i];
+            if s.relative
+                && s.start_ms.is_none()
+                && let Some(ti) = s.track.as_deref().and_then(|k| self.track_by_key(k))
+                && let Some((t0, _)) = self.tracks[ti].full_time_range()
+            {
+                let key = Self::acc_key(s);
+                self.acc_sets[i].start_ms = Some(t0 * 1000);
+                self.acc_start_guessed.insert(key);
+            }
+        }
+        use std::hash::{Hash, Hasher};
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let p = &self.acc_params;
+            (
+                p.band.0.to_bits(),
+                p.band.1.to_bits(),
+                p.flight_g.to_bits(),
+                p.min_peak_frac.to_bits(),
+                p.k,
+            )
+                .hash(&mut h);
+            for s in &self.acc_sets {
+                (
+                    &s.id,
+                    &s.file,
+                    s.bursts.len(),
+                    s.start_ms,
+                    s.clock_rate.to_bits(),
+                )
+                    .hash(&mut h);
+            }
+            h.finish()
+        };
+        let anno_key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (key, self.visible_key(), self.tracks.len()).hash(&mut h);
+            for s in &self.acc_sets {
+                s.track.hash(&mut h);
+            }
+            h.finish()
+        };
+        if self
+            .acc_cache
+            .as_ref()
+            .is_some_and(|c| c.anno_key == anno_key)
+        {
+            return;
+        }
+        let a = match self.acc_cache.take() {
+            Some(c) if c.key == key => c.a,
+            _ => crate::acc::analyse(&self.acc_sets, &self.acc_params),
+        };
+        let keys: Vec<String> = (0..self.tracks.len()).map(|i| self.track_key(i)).collect();
+        for (tr, tk) in self.tracks.iter_mut().zip(keys) {
+            tr.fixes.iter_mut().for_each(|f| f.acc = None);
+            let sets: Vec<usize> = (0..self.acc_sets.len())
+                .filter(|&i| self.acc_sets[i].track.as_deref() == Some(tk.as_str()))
+                .collect();
+            if sets.is_empty() {
+                continue;
+            }
+            for (fi, fa) in crate::acc::summarise_track(tr, &sets, &a) {
+                tr.fixes[fi].acc = Some(Box::new(fa));
+            }
+        }
+        self.acc_cache = Some(AccCache { key, a, anno_key });
+    }
+
+    fn acc_panel(&mut self, ui: &mut egui::Ui) {
+        use crate::acc::{BAND_PRESETS, Format};
+        if self.acc_sets.is_empty() {
+            ui.weak(
+                "Open acceleration files like any other: Movebank e-obs bursts (eobs:accelerations-raw), \
+                 Movebank / Technosmart / any per-sample x-y-z table, or FleaTag .txt / .csv exports. \
+                 They are matched to tracks by id and summarised per fix.",
+            );
+            return;
+        }
+        // ---- datasets
+        let tracks: Vec<(String, String)> = (0..self.tracks.len())
+            .map(|i| (self.track_key(i), self.tracks[i].id.clone()))
+            .collect();
+        let mut remove = None;
+        for i in 0..self.acc_sets.len() {
+            let key = Self::acc_key(&self.acc_sets[i]);
+            let guessed = self.acc_start_guessed.contains(&key);
+            let s = &mut self.acc_sets[i];
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&s.id);
+                let sr = s.bursts.first().map(|b| b.sr).unwrap_or(0.0);
+                ui.weak(format!(
+                    "{} · {} bursts · {sr:.0} Hz · {}",
+                    s.format.label(),
+                    s.bursts.len(),
+                    s.file
+                ));
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Remove this animal's ACC data")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("track");
+                let cur = s
+                    .track
+                    .as_ref()
+                    .and_then(|k| tracks.iter().find(|t| &t.0 == k))
+                    .map(|t| t.1.clone())
+                    .unwrap_or_else(|| "(none)".into());
+                egui::ComboBox::from_id_salt(("acc_trk", i))
+                    .selected_text(cur)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.track, None, "(none)");
+                        for (k, name) in &tracks {
+                            ui.selectable_value(&mut s.track, Some(k.clone()), name);
+                        }
+                    });
+            });
+            if s.format == Format::FleaTag {
+                let txt = self
+                    .acc_start_text
+                    .entry(key.clone())
+                    .or_insert_with(|| s.start_ms.map(|t| fmt_time(t / 1000)).unwrap_or_default());
+                ui.horizontal(|ui| {
+                    ui.label("tag start (UTC)");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(txt)
+                            .desired_width(150.0)
+                            .hint_text("YYYY-MM-DD HH:MM:SS"),
+                    );
+                    if r.lost_focus()
+                        && let Some(t) = crate::table::parse_time_ms(txt)
+                    {
+                        s.start_ms = Some(t);
+                        self.acc_start_guessed.remove(&key);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("clock rate");
+                    let mut pct = s.clock_rate * 100.0;
+                    if ui
+                        .add(egui::DragValue::new(&mut pct).speed(0.05).range(-10.0..=10.0).suffix(" %"))
+                        .on_hover_text("Real elapsed time = tag time × (1 + rate); FleaTags run ~1–2 % off (see hummingbird_activity_budget.R)")
+                        .changed()
+                    {
+                        s.clock_rate = pct / 100.0;
+                    }
+                });
+                if guessed {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 190, 90),
+                        "FleaTags have no clock - start set to the track's first fix; enter the real tag start",
+                    );
+                }
+            }
+        }
+        if let Some(i) = remove {
+            let s = self.acc_sets.remove(i);
+            if !self.acc_sets.iter().any(|x| x.file == s.file) {
+                self.acc_files.retain(|f| f.name != s.file);
+            }
+            self.acc_cache = None;
+        }
+        ui.separator();
+        // ---- settings (applied with a button)
+        let e = &mut self.acc_edit;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("wingbeat band");
+            egui::ComboBox::from_id_salt("acc_band")
+                .selected_text("preset")
+                .show_ui(ui, |ui| {
+                    for (n, b) in BAND_PRESETS {
+                        if ui.selectable_label(e.band == b, n).clicked() {
+                            e.band = b;
+                        }
+                    }
+                });
+            ui.add(
+                egui::DragValue::new(&mut e.band.0)
+                    .speed(0.2)
+                    .range(0.5..=200.0)
+                    .suffix(" Hz"),
+            );
+            ui.label("–");
+            ui.add(
+                egui::DragValue::new(&mut e.band.1)
+                    .speed(0.2)
+                    .range(1.0..=250.0)
+                    .suffix(" Hz"),
+            );
+        });
+        ui.add(egui::Slider::new(&mut e.flight_g, 0.05..=5.0).logarithmic(true).text("flight: dynamic SD > (g)"))
+            .on_hover_text("Bursts are flight above this (flea: 1 g for hummingbird bursts; bats on e-obs tags often 0.3–0.8 g)");
+        ui.add(
+            egui::Slider::new(&mut e.min_peak_frac, 0.0..=0.8).text("… and wingbeat peak share ≥"),
+        )
+        .on_hover_text("Also require a clear rhythmic peak in the band (0 = off)");
+        ui.add(egui::Slider::new(&mut e.k, 0..=8).text("behaviour clusters (k-means, 0 = off)"));
+        ui.add(
+            egui::Slider::new(&mut e.window_s, 0.3..=10.0)
+                .logarithmic(true)
+                .suffix(" s")
+                .text("window for continuous data"),
+        );
+        ui.horizontal(|ui| {
+            let mut ov = self.acc_slope.is_some();
+            if ui
+                .checkbox(&mut ov, "e-obs g per count")
+                .on_hover_text(
+                    "Default by tag generation: ≤2241 → 0.001, ≤4117 → 0.0022, newer → 1/512",
+                )
+                .changed()
+            {
+                self.acc_slope = if ov { Some(1.0 / 512.0) } else { None };
+                self.reread_acc();
+            }
+            if let Some(v) = self.acc_slope.as_mut()
+                && ui
+                    .add(egui::DragValue::new(v).speed(0.0001).range(0.0001..=0.05))
+                    .lost_focus()
+            {
+                self.reread_acc();
+            }
+        });
+        let has_labels = self
+            .acc_sets
+            .iter()
+            .any(|s| s.bursts.iter().any(|b| b.label.is_some()));
+        if has_labels {
+            ui.checkbox(
+                &mut self.acc_edit.use_labels,
+                "classify behaviour from the annotated bursts (kNN)",
+            )
+            .on_hover_text("The files carry behaviour annotations (annotation-layer-*): train a 7-nearest-neighbour classifier on them and label every burst");
+        }
+        let changed = self.acc_edit != self.acc_params;
+        if ui
+            .add_enabled(changed, egui::Button::new("Apply"))
+            .clicked()
+        {
+            let rewindow = self.acc_edit.window_s != self.acc_params.window_s;
+            self.acc_params = self.acc_edit;
+            if rewindow {
+                self.reread_acc();
+            }
+        }
+        // ---- clusters
+        let Some(c) = &self.acc_cache else { return };
+        let total: usize = c.a.per_set.iter().map(|v| v.len()).sum();
+        let flight: usize = c.a.per_set.iter().flatten().filter(|x| x.flight).count();
+        ui.label(format!(
+            "{total} bursts · {:.0} % flight",
+            100.0 * flight as f32 / total.max(1) as f32
+        ));
+        if c.a.params.k >= 2 {
+            egui::Grid::new("acc_clusters")
+                .striped(true)
+                .show(ui, |ui| {
+                    for h in ["cluster", "bursts", "dyn SD", "wingbeat", "pitch", "flight"] {
+                        ui.strong(h);
+                    }
+                    if !c.a.classes.is_empty() {
+                        ui.strong("annotated as");
+                    }
+                    ui.end_row();
+                    for (i, ci) in c.a.clusters.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let (r, _) =
+                                ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().rect_filled(
+                                r,
+                                2.0,
+                                CLUSTER_COLORS[i % CLUSTER_COLORS.len()],
+                            );
+                            ui.label(format!("C{}", i + 1));
+                        });
+                        ui.label(ci.n.to_string());
+                        ui.label(format!("{:.2} g", ci.dyn_sd));
+                        ui.label(
+                            ci.wbf_hz
+                                .map(|w| format!("{w:.1} Hz"))
+                                .unwrap_or("-".into()),
+                        );
+                        ui.label(format!("{:.0}°", ci.pitch_deg));
+                        ui.label(format!("{:.0} %", ci.flight_frac * 100.0));
+                        if !c.a.classes.is_empty() {
+                            let mix: Vec<String> = ci
+                                .label_frac
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, x)| **x >= 0.05)
+                                .map(|(k, x)| format!("{} {:.0}%", c.a.classes[k], x * 100.0))
+                                .collect();
+                            ui.label(if mix.is_empty() {
+                                "-".into()
+                            } else {
+                                mix.join(", ")
+                            });
+                        }
+                        ui.end_row();
+                    }
+                });
+            ui.weak("Clusters are numbered from calmest (C1) to most dynamic; name them from these profiles.");
+        }
+        if let Some(rep) = &c.a.classifier {
+            ui.separator();
+            ui.label(format!(
+                "Behaviour classifier ({}-NN on {} annotated bursts), {}-fold time-blocked cross-validation: {:.0} % correct, balanced accuracy {:.0} % (mean recall per behaviour)",
+                rep.k,
+                rep.n_train,
+                rep.folds,
+                rep.accuracy * 100.0,
+                rep.balanced_accuracy * 100.0
+            ));
+            egui::Grid::new("acc_confusion")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("annotated ↓ / predicted →");
+                    for (k, name) in c.a.classes.iter().enumerate() {
+                        ui.colored_label(BEHAVIOUR_COLORS[k % BEHAVIOUR_COLORS.len()], name);
+                    }
+                    ui.strong("recall");
+                    ui.end_row();
+                    for (i, name) in c.a.classes.iter().enumerate() {
+                        ui.label(name);
+                        let row = &rep.confusion[i];
+                        for v in row {
+                            ui.label(v.to_string());
+                        }
+                        let n: usize = row.iter().sum();
+                        ui.label(if n > 0 {
+                            format!("{:.0} %", 100.0 * row[i] as f32 / n as f32)
+                        } else {
+                            "-".into()
+                        });
+                        ui.end_row();
+                    }
+                });
+            ui.weak("Every burst gets a predicted behaviour; fixes get the shares over their step (colour by 'ACC: behaviour').");
+        }
+        if ui
+            .button("export burst features CSV")
+            .on_hover_text(
+                "One row per burst: all features, flight flag, cluster and the matched track",
+            )
+            .clicked()
+        {
+            let csv = {
+                let tr_of = |si: usize| {
+                    self.acc_sets[si]
+                        .track
+                        .as_deref()
+                        .and_then(|k| self.track_by_key(k))
+                        .map(|i| self.tracks[i].id.clone())
+                        .unwrap_or_default()
+                };
+                crate::acc::bursts_csv(&self.acc_sets, &c.a, tr_of)
+            };
+            self.save_csv("fintrack_acc_bursts.csv", csv);
+        }
+        ui.weak("Per-fix summaries (acc_* columns) are added to the annotated CSV export.");
+    }
+
+    /// Waveform and spectrum of the burst nearest the cursor for the focused track.
+    fn acc_burst_chart(&mut self, ui: &mut Ui) {
+        let Some(c) = &self.acc_cache else {
+            ui.weak("Load acceleration data to see bursts.");
+            return;
+        };
+        let focus = self
+            .selected_track
+            .or(self.selected.map(|s| s.0))
+            .or_else(|| self.tracks.iter().position(|t| t.visible));
+        let tk = focus.map(|i| self.track_key(i));
+        let t_ms = (self.t_now * 1000.0) as i64;
+        let mut best: Option<(i64, usize, usize)> = None;
+        for (si, s) in self.acc_sets.iter().enumerate() {
+            if tk.is_some() && s.track != tk {
+                continue;
+            }
+            for (bi, r) in c.a.per_set[si].iter().enumerate() {
+                let d = (r.f.t_ms - t_ms).abs();
+                if best.is_none_or(|b| d < b.0) {
+                    best = Some((d, si, bi));
+                }
+            }
+        }
+        let Some((_, si, bi)) = best else {
+            ui.weak("No ACC data for this track.");
+            return;
+        };
+        // per_set holds only bursts with absolute times, in order: map back by time
+        let row = &c.a.per_set[si][bi];
+        let (f, fl, cl) = (&row.f, &row.flight, &row.cluster);
+        let cls = |i: Option<usize>| i.and_then(|i| c.a.classes.get(i).cloned());
+        let set = &self.acc_sets[si];
+        let Some(b) = set.bursts.iter().find(|b| set.abs_ms(b) == Some(f.t_ms)) else {
+            return;
+        };
+        ui.label(format!(
+            "{} · {} · {:.2} s · dyn SD {:.2} g · wingbeat {} · {}{}{}{}",
+            set.id,
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(f.t_ms)
+                .map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+                .unwrap_or_default(),
+            f.dur_s,
+            f.dyn_sd,
+            f.wbf_hz
+                .map(|w| format!("{w:.1} Hz (peak {:.0} %)", f.peak_frac * 100.0))
+                .unwrap_or("-".into()),
+            if *fl { "flight" } else { "not flight" },
+            if c.a.params.k >= 2 {
+                format!(" · C{}", cl + 1)
+            } else {
+                String::new()
+            },
+            cls(row.label)
+                .map(|l| format!(" · annotated {l}"))
+                .unwrap_or_default(),
+            cls(row.behaviour)
+                .map(|l| format!(" · predicted {l}"))
+                .unwrap_or_default()
+        ));
+        let sr = b.sr as f64;
+        let axes: Vec<Vec<[f64; 2]>> = (0..3)
+            .map(|k| {
+                b.xyz
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| [i as f64 / sr * 1000.0, v[k] as f64])
+                    .collect()
+            })
+            .collect();
+        let dyn_: Vec<[f64; 3]> = b
+            .xyz
+            .iter()
+            .map(|v| {
+                [
+                    (v[0] - f.mean[0]) as f64,
+                    (v[1] - f.mean[1]) as f64,
+                    (v[2] - f.mean[2]) as f64,
+                ]
+            })
+            .collect();
+        let (fr, pw) = crate::acc::spectrum(&dyn_, sr);
+        let spec: Vec<[f64; 2]> = fr
+            .iter()
+            .zip(&pw)
+            .map(|(x, p)| [*x, p[0] + p[1] + p[2]])
+            .collect();
+        let band = c.a.params.band;
+        let w = ui.available_width();
+        ui.horizontal(|ui| {
+            Plot::new("acc_wave")
+                .width(w * 0.6)
+                .legend_if(!self.narrow)
+                .x_axis_label("ms")
+                .y_axis_label("g")
+                .allow_scroll(false)
+                .show(ui, |pui| {
+                    for (k, (name, col)) in [
+                        ("x", Color32::from_rgb(230, 97, 1)),
+                        ("y", Color32::from_rgb(94, 60, 153)),
+                        ("z", Color32::from_rgb(77, 175, 74)),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        pui.line(
+                            Line::new(name, PlotPoints::from(axes[k].clone()))
+                                .color(col)
+                                .width(1.3),
+                        );
+                    }
+                });
+            Plot::new("acc_spec")
+                .width(w * 0.38)
+                .x_axis_label("Hz")
+                .allow_scroll(false)
+                .show(ui, |pui| {
+                    pui.line(
+                        Line::new("power (x+y+z)", PlotPoints::from(spec))
+                            .color(Color32::from_gray(220)),
+                    );
+                    pui.vline(
+                        egui_plot::VLine::new("band", band.0 as f64).color(Color32::from_gray(90)),
+                    );
+                    pui.vline(
+                        egui_plot::VLine::new("band", band.1 as f64).color(Color32::from_gray(90)),
+                    );
+                    if let Some(w) = f.wbf_hz {
+                        pui.vline(
+                            egui_plot::VLine::new("wingbeat", w as f64)
+                                .color(Color32::from_rgb(255, 160, 40)),
+                        );
+                    }
+                });
+        });
+    }
+
+    // ------------------------------------------------------------------ weather & storms
+
+    /// Cyclones for the tracks: the per-year IBTrACS files published with the web app
+    /// (built weekly from NOAA NCEI by CI — NOAA's own servers don't allow browser
+    /// requests), falling back to NOAA AOML's ERDDAP (works from the desktop app).
+    fn fetch_cyclones(&mut self, ctx: &egui::Context) {
+        let (mut s, mut n, mut w, mut e) = (90.0f64, -90.0f64, 180.0f64, -180.0f64);
+        for f in self
+            .tracks
+            .iter()
+            .filter(|t| t.visible)
+            .flat_map(|t| t.fixes.iter())
+        {
+            s = s.min(f.lat);
+            n = n.max(f.lat);
+            w = w.min(f.lon);
+            e = e.max(f.lon);
+        }
+        if s > n {
+            return;
+        }
+        let q = (
+            self.t_min as i64 - 3 * 86_400,
+            self.t_max as i64 + 3 * 86_400,
+            (s - 25.0).max(-90.0),
+            (n + 25.0).min(90.0),
+            (w - 25.0).max(-180.0),
+            (e + 25.0).min(180.0),
+        );
+        self.storms_query = Some(q);
+        let year = |t: i64| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+                .map(|d| chrono::Datelike::year(&d))
+                .unwrap_or(1980)
+        };
+        let years: Vec<i32> = (year(q.0)..=year(q.1)).collect();
+        self.storms_years_left = years.len();
+        self.storms_years_ok = 0;
+        self.storms_acc.clear();
+        self.storms_busy = true;
+        self.status(format!(
+            "IBTrACS: loading tropical-cyclone tracks for {}",
+            years
+                .iter()
+                .map(|y| y.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        let base = if cfg!(target_arch = "wasm32") {
+            "data/ibtracs/".to_string()
+        } else {
+            format!("{}data/ibtracs/", share::WEB_APP_URL)
+        };
+        for y in years {
+            let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+            let mut req = ehttp::Request::get(format!("{base}{y}.csv"));
+            req.timeout = Some(std::time::Duration::from_secs(60));
+            ehttp::fetch(req, move |res| {
+                let result = match res {
+                    Ok(r) if r.ok => Ok(r.bytes),
+                    Ok(r) => Err(format!("HTTP {}", r.status)),
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send(Msg::Cyclones {
+                    name: format!("IBTrACS {y}"),
+                    result,
+                    year: Some(y),
+                });
+                ctx2.request_repaint();
+            });
+        }
+    }
+
+    /// One year file arrived: keep storms that touch the query window and area.
+    fn on_cyclone_year(
+        &mut self,
+        name: &str,
+        result: Result<Vec<u8>, String>,
+        ctx: &egui::Context,
+    ) {
+        self.storms_years_left = self.storms_years_left.saturating_sub(1);
+        let Some((t0, t1, s, n, w, e)) = self.storms_query else {
+            return;
+        };
+        if let Ok(bytes) = result {
+            self.storms_years_ok += 1;
+            if let Ok(v) = crate::cyclones::parse(name, &bytes, Some((t0, t1))) {
+                for st in v {
+                    if !st
+                        .pts
+                        .iter()
+                        .any(|p| p.lat >= s && p.lat <= n && p.lon >= w && p.lon <= e)
+                    {
+                        continue;
+                    }
+                    match self.storms_acc.iter_mut().find(|x| x.sid == st.sid) {
+                        Some(x) => {
+                            x.pts.extend(st.pts);
+                            x.pts.sort_by_key(|p| p.t);
+                            x.pts.dedup_by_key(|p| p.t);
+                        }
+                        None => self.storms_acc.push(st),
+                    }
+                }
+            }
+        }
+        if self.storms_years_left > 0 {
+            return;
+        }
+        if self.storms_years_ok == 0 {
+            // not published (yet) or unreachable: try NOAA's ERDDAP directly
+            self.fetch_cyclones_erddap(ctx);
+            return;
+        }
+        self.storms_busy = false;
+        self.storms = std::mem::take(&mut self.storms_acc);
+        self.storms_on = true;
+        let names: Vec<String> = self.storms.iter().map(|s| s.label()).collect();
+        self.status(if names.is_empty() {
+            "IBTrACS: no tropical cyclones near the tracks during their time span".to_string()
+        } else {
+            format!(
+                "Tropical cyclones (IBTrACS): {} storm(s) - {}",
+                names.len(),
+                names.join(", ")
+            )
+        });
+    }
+
+    fn fetch_cyclones_erddap(&mut self, ctx: &egui::Context) {
+        let Some((t0, t1, s, n, w, e)) = self.storms_query else {
+            return;
+        };
+        let url = crate::cyclones::erddap_url(t0, t1, s, n, w, e);
+        self.storms_busy = true;
+        self.status(
+            "IBTrACS: asking NOAA ERDDAP for tropical cyclones near the tracks…".to_string(),
+        );
+        let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+        let mut req = ehttp::Request::get(url);
+        req.timeout = Some(std::time::Duration::from_secs(120));
+        ehttp::fetch(req, move |res| {
+            let result = match res {
+                Ok(r) if r.ok => Ok(r.bytes),
+                Ok(r) => Err(format!(
+                    "HTTP {} {}",
+                    r.status,
+                    r.text().unwrap_or("").chars().take(200).collect::<String>()
+                )),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(Msg::Cyclones {
+                name: "IBTrACS (ERDDAP)".into(),
+                result,
+                year: None,
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    fn import_cyclones_dialog(&self, ctx: &egui::Context) {
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("IBTrACS CSV", &["csv", "gz"])
+                .pick_file()
+            {
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let result = std::fs::read(&p).map_err(|e| e.to_string());
+                let _ = tx.send(Msg::Cyclones {
+                    name,
+                    result,
+                    year: None,
+                });
+                ctx.request_repaint();
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(f) = rfd::AsyncFileDialog::new()
+                .add_filter("IBTrACS CSV", &["csv", "gz"])
+                .pick_file()
+                .await
+            {
+                let bytes = f.read().await;
+                let _ = tx.send(Msg::Cyclones {
+                    name: f.file_name(),
+                    result: Ok(bytes),
+                    year: None,
+                });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// ERA5 download options, data source, Annotate, progress / retry / cancel.
+    fn era5_download_ui(&mut self, ui: &mut Ui) {
+        egui::ComboBox::from_label("model")
+            .selected_text(self.opts.model.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.opts.model, Model::Era5, Model::Era5.label());
+                ui.selectable_value(
+                    &mut self.opts.model,
+                    Model::BestMatch,
+                    Model::BestMatch.label(),
+                );
+            });
+        egui::ComboBox::from_label("wind level")
+            .selected_text(self.opts.level.label())
+            .show_ui(ui, |ui| {
+                for l in [WindLevel::Auto, WindLevel::M10, WindLevel::M100] {
+                    ui.selectable_value(&mut self.opts.level, l, l.label());
+                }
+            });
+        ui.checkbox(
+            &mut self.opts.segments,
+            "sample wind along each step (hourly)",
+        )
+        .on_hover_text("Fixes can be hours apart: sample the wind along each step");
+        ui.add_enabled(
+            self.opts.segments,
+            egui::Checkbox::new(&mut self.opts.night_only, "night hours only (sun < −6°)"),
+        );
+        ui.add_enabled(
+            self.opts.segments,
+            egui::Slider::new(&mut self.opts.max_segment_h, 6.0..=168.0)
+                .text("max step length (h)"),
+        );
+        self.era5_source_ui(ui);
+        let busy = !self.downloads_idle();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.tracks.is_empty() && !busy,
+                    egui::Button::new("Annotate with ERA5"),
+                )
+                .clicked()
+            {
+                self.start_weather();
+            }
+            if ui
+                .add_enabled(!self.store.is_empty(), egui::Button::new("Re-apply"))
+                .on_hover_text("Recompute with the current options from cached data")
+                .clicked()
+            {
+                let n = weather::annotate(&mut self.tracks, &self.store, &self.opts);
+                self.status(format!("Re-annotated {n} fixes"));
+            }
+        });
+        if busy || self.req_total > 0 && self.req_done < self.req_total {
+            let frac = if self.req_total > 0 {
+                self.req_done as f32 / self.req_total as f32
+            } else {
+                0.0
+            };
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .text(format!("{}/{} requests", self.req_done, self.req_total)),
+            );
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
+            if !self.cds_running.is_empty() || !self.cds_pending.is_empty() {
+                let waiting = self
+                    .cds_running
+                    .iter()
+                    .filter(|r| matches!(r.stage, CdsStage::Poll(_)))
+                    .count();
+                ui.weak(format!(
+                    "Copernicus CDS: {} running ({waiting} queued at CDS), {} waiting here",
+                    self.cds_running.len(),
+                    self.cds_pending.len()
+                ));
+            }
+            if let Some(n) = &self.wait_note {
+                ui.colored_label(Color32::from_rgb(255, 190, 90), n);
+            }
+            if self.req_failed > 0 {
+                ui.weak(format!("{} failed - see the log", self.req_failed));
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+                    if !self.queue.is_empty()
+                        && ui
+                            .button("Cancel downloads")
+                            .on_hover_text("Stop the queued requests (they can be resumed with 'Retry failed')")
+                            .clicked()
+                    {
+                        let n = self.queue.len();
+                        self.failed_jobs.extend(self.queue.drain(..));
+                        self.req_total = self.req_total.saturating_sub(n);
+                        self.pause_until = 0.0;
+                        self.status(format!("Cancelled {n} queued request(s)"));
+                    }
+                    if !self.failed_jobs.is_empty()
+                        && ui
+                            .button(format!("Retry failed ({})", self.failed_jobs.len()))
+                            .on_hover_text("Queue the requests that failed (server overloaded, timeouts) or were cancelled")
+                            .clicked()
+                    {
+                        let jobs: Vec<Job> = std::mem::take(&mut self.failed_jobs);
+                        for j in &jobs {
+                            self.retries.remove(j.url());
+                        }
+                        self.pause_until = 0.0;
+                        self.enqueue(jobs);
+                    }
+                });
+        if !self.store.is_empty() {
+            ui.weak(format!(
+                "cache: {} cells · {} hours",
+                self.store.cells.len(),
+                self.store.hours()
+            ));
+        }
+    }
+
+    /// Wind arrows at fixes and the wind field around the animals (download extent, palette).
+    fn wind_map_ui(&mut self, ui: &mut Ui) {
+        ui.checkbox(&mut self.show_wind_arrows, "wind arrows at fixes");
+        ui.checkbox(&mut self.show_wind_field, "ERA5 wind field at cursor time");
+        ui.indent("wind_field_opts", |ui| {
+                    ui.add_enabled(
+                        self.show_wind_field,
+                        egui::Checkbox::new(&mut self.wind_field_night_only, "night cells only (sun < −6°)"),
+                    )
+                    .on_hover_text("Draw wind arrows only where the sun is more than 6° below the horizon at the cursor time");
+                    ui.checkbox(&mut self.skip_daytime, "skip daytime during playback")
+                        .on_hover_text("Playback jumps ahead whenever it is day across the whole wind-field / track area");
+                    let mut pal = self.wind_palette();
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("wind_palette").selected_text(pal.label()).show_ui(ui, |ui| {
+                            for p in WindPalette::ALL {
+                                ui.selectable_value(&mut pal, p, p.label());
+                            }
+                        });
+                        ui.label("palette");
+                        if self.wind_palettes.contains_key(&self.basemap)
+                            && ui.small_button("default").on_hover_text("Use this basemap's default palette").clicked()
+                        {
+                            self.wind_palettes.remove(&self.basemap);
+                            pal = WindPalette::default_for(self.basemap);
+                        }
+                    })
+                    .response
+                    .on_hover_text("Remembered separately for each basemap");
+                    if pal != self.wind_palette() {
+                        self.wind_palettes.insert(self.basemap, pal);
+                    }
+                });
+        ui.label("Wind field around the animals (fetched a week at a time):");
+        let old_field = (self.opts.field_margin_deg, self.opts.field_stride);
+        ui.add(
+                    egui::Slider::new(&mut self.opts.field_margin_deg, 0.0..=8.0)
+                        .step_by(0.25)
+                        .suffix("°")
+                        .text("wind-field radius"),
+                )
+                .on_hover_text("Download wind arrows this far around each animal, for the week in view (fetched as you move through time). 0 = only at the fixes");
+        let spacing = |s: i32| format!("{}°", s as f64 * weather::GRID);
+        ui.add_enabled_ui(self.opts.field_margin_deg > 0.0, |ui| {
+            egui::ComboBox::from_label("wind-field spacing")
+                .selected_text(spacing(self.opts.field_stride))
+                .show_ui(ui, |ui| {
+                    for s in [1, 2, 4] {
+                        ui.selectable_value(&mut self.opts.field_stride, s, spacing(s));
+                    }
+                });
+        });
+        if old_field != (self.opts.field_margin_deg, self.opts.field_stride) {
+            self.surface_field_days.clear();
+        }
+        if self.opts.field_margin_deg > 0.0 && !self.tracks.is_empty() {
+            let day = weather::day_of(self.t_now as i64);
+            let pts = weather::window_points(
+                &self.tracks,
+                day,
+                7,
+                self.opts.field_margin_deg as f64,
+                self.opts.field_stride,
+            );
+            let mut cells: Vec<weather::CellKey> =
+                pts.iter().map(|p| weather::cell_of(p.0, p.1)).collect();
+            cells.sort_unstable();
+            cells.dedup();
+            let n = cells.len();
+            let txt = if self.surface_field_on {
+                format!("≈{n} wind-field cells for this week (≈{n} API calls)")
+            } else {
+                format!("≈{n} wind-field cells per week, fetched after the first Annotate")
+            };
+            if n > 1500 {
+                ui.colored_label(
+                    Color32::from_rgb(255, 180, 80),
+                    txt + " - consider a smaller radius or wider spacing",
+                );
+            } else {
+                ui.weak(txt);
+            }
+        }
+    }
+
+    /// ERA5 colour field, isobars and pressure centres (2D map).
+    fn wx_fields_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::wxfield::FieldVar;
+        let before = (self.wx_field, self.wx_isobars, self.wx_centres);
+        egui::ComboBox::from_label("colour field")
+            .selected_text(self.wx_field.label())
+            .show_ui(ui, |ui| {
+                for v in FieldVar::ALL {
+                    ui.selectable_value(&mut self.wx_field, v, v.label());
+                }
+            });
+        ui.checkbox(&mut self.wx_isobars, "isobars (4 hPa)");
+        ui.checkbox(&mut self.wx_centres, "lows / highs and storms")
+            .on_hover_text("L / H at MSL pressure extremes; a low is marked as a storm when ≤ 995 hPa or with gale-force (≥ 17.2 m/s) 10 m wind nearby");
+        if before != (self.wx_field, self.wx_isobars, self.wx_centres) {
+            // the fields come from the wind-field downloads around the animals
+            self.surface_field_days.clear();
+        }
+        ui.weak("Colour fields, isobars and storms use the wind-field downloads around the animals (radius / spacing above).");
+    }
+
+    /// Tropical cyclones (IBTrACS): load, list, closest approach.
+    fn cyclones_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!self.tracks.is_empty() && !self.storms_busy, egui::Button::new("Load for the tracks"))
+                .on_hover_text("Hurricanes / typhoons within ±25° of the tracks during their time span, from NOAA AOML's ERDDAP (IBTrACS since 1980)")
+                .clicked()
+            {
+                self.fetch_cyclones(ui.ctx());
+            }
+            if ui
+                .button("Import IBTrACS CSV…")
+                .on_hover_text("e.g. ibtracs.last3years.list.v04r01.csv or a basin file from NCEI")
+                .clicked()
+            {
+                self.import_cyclones_dialog(ui.ctx());
+            }
+            if self.storms_busy {
+                ui.spinner();
+            }
+        });
+        if self.storms.is_empty() {
+            return;
+        }
+        ui.checkbox(
+            &mut self.storms_on,
+            format!("show {} storm(s)", self.storms.len()),
+        );
+        // closest approach of any visible animal to each storm
+        egui::ScrollArea::vertical()
+            .max_height(160.0)
+            .id_salt("storm_list")
+            .show(ui, |ui| {
+                egui::Grid::new("storms").striped(true).show(ui, |ui| {
+                    for h in ["storm", "peak", "closest animal"] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for st in &self.storms {
+                        let (cat, col) =
+                            crate::cyclones::category(st.peak_category(), st.max_wind_kt(), "");
+                        ui.colored_label(col, st.label());
+                        ui.label(format!(
+                            "{cat}{}",
+                            st.max_wind_kt()
+                                .map(|w| format!(", {w:.0} kt"))
+                                .unwrap_or_default()
+                        ));
+                        let mut best: Option<(f64, &str, i64)> = None;
+                        for tr in self.tracks.iter().filter(|t| t.visible) {
+                            for f in &tr.fixes {
+                                if let Some(p) = st.at(f.t) {
+                                    let d = crate::geo::haversine_m(f.lat, f.lon, p.lat, p.lon)
+                                        / 1000.0;
+                                    if best.is_none_or(|b| d < b.0) {
+                                        best = Some((d, &tr.id, f.t));
+                                    }
+                                }
+                            }
+                        }
+                        ui.label(
+                            best.map(|(d, id, t)| format!("{d:.0} km · {id} · {}", fmt_date(t)))
+                                .unwrap_or("not during the tracks".into()),
+                        );
+                        ui.end_row();
+                    }
+                });
+            });
+        ui.weak("Annotated CSV export gains tc_name / tc_distance_km / tc_wind_kt / tc_category (nearest cyclone within 1500 km at each fix). Data: NOAA NCEI IBTrACS v04r01.");
+    }
+
+    // ------------------------------------------------------------------ structures
+
+    /// Queue OpenStreetMap downloads for the corridor around the visible tracks.
+    fn plan_structures(&mut self) {
+        if !self.st_on || self.tracks.is_empty() {
+            return;
+        }
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (self.visible_key(), self.st_params.radius_m.to_bits()).hash(&mut h);
+            h.finish()
+        };
+        if self.st_planned == Some(key) {
+            return;
+        }
+        self.st_planned = Some(key);
+        let buffer = (self.st_params.radius_m as f64).max(2000.0);
+        let queued: HashSet<crate::structures::Tile> =
+            self.st_queue.iter().flatten().copied().collect();
+        let tiles: Vec<crate::structures::Tile> =
+            crate::structures::corridor_tiles(&self.tracks, buffer)
+                .into_iter()
+                .filter(|t| !self.st_store.tiles.contains(t) && !queued.contains(t))
+                .collect();
+        if tiles.is_empty() {
+            return;
+        }
+        let n = tiles.len();
+        for c in tiles.chunks(crate::structures::TILES_PER_QUERY) {
+            self.st_queue.push_back(c.to_vec());
+        }
+        self.status(format!(
+            "OpenStreetMap: wind turbines & tall structures for {n} tile(s) of {}° along the tracks",
+            crate::structures::TILE_DEG
+        ));
+    }
+
+    /// One Overpass request at a time (the public servers allow very few per IP).
+    fn pump_structures(&mut self, ctx: &egui::Context) {
+        if self.st_busy || self.st_queue.is_empty() {
+            return;
+        }
+        if self.now < self.st_next_at {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+        let Some(tiles) = self.st_queue.pop_front() else {
+            return;
+        };
+        let server =
+            crate::structures::OVERPASS[self.st_server % crate::structures::OVERPASS.len()];
+        let mut req = crate::structures::overpass_request(server, &tiles, true);
+        req.timeout = Some(std::time::Duration::from_secs(200));
+        self.st_busy = true;
+        let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+        ehttp::fetch(req, move |res| {
+            let result = match res {
+                Ok(r) if r.ok => r
+                    .text()
+                    .map(str::to_string)
+                    .ok_or_else(|| "non-UTF8 body".into()),
+                Ok(r) => Err(format!(
+                    "HTTP {} {}",
+                    r.status,
+                    r.text()
+                        .map(|t| t.chars().take(300).collect::<String>())
+                        .unwrap_or_default()
+                )),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(Msg::Overpass { tiles, result });
+            ctx2.request_repaint();
+        });
+    }
+
+    fn on_overpass(&mut self, tiles: Vec<crate::structures::Tile>, result: Result<String, String>) {
+        self.st_busy = false;
+        match result.and_then(|b| crate::structures::parse_overpass(&b)) {
+            Ok(v) => {
+                let n = self.st_store.add(v);
+                self.st_store.tiles.extend(tiles.iter().copied());
+                if self.st_queue.is_empty() {
+                    self.status(format!(
+                        "OpenStreetMap structures loaded: {} in total (+{n})",
+                        self.st_store.items.len()
+                    ));
+                }
+            }
+            Err(e) => {
+                let tries = self.st_retry.entry(tiles.clone()).or_insert(0);
+                *tries += 1;
+                if *tries <= 2 {
+                    // busy / timed out: other server, short pause, retry
+                    self.st_server += 1;
+                    self.st_next_at = self.now + 10.0 * *tries as f64;
+                    self.st_queue.push_front(tiles);
+                    self.status(format!("Overpass: {e} - retrying"));
+                } else {
+                    self.st_failed += tiles.len();
+                    self.st_store.tiles.extend(tiles.iter().copied());
+                    self.status(format!(
+                        "! Overpass failed for {} tile(s): {e}",
+                        tiles.len()
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Recompute encounters when tracks, structures, annotations or parameters change.
+    fn ensure_st_cache(&mut self) {
+        if !self.st_on || self.st_store.is_empty() {
+            self.st_cache = None;
+            return;
+        }
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let p = &self.st_params;
+            (
+                self.visible_key(),
+                self.st_store.version,
+                p.radius_m.to_bits(),
+                p.min_other_height_m.to_bits(),
+                p.include_other,
+            )
+                .hash(&mut h);
+            // annotations (surface pressure → height above ground)
+            let annotated: usize = self
+                .tracks
+                .iter()
+                .map(|t| {
+                    t.fixes
+                        .iter()
+                        .filter(|f| f.weather.surface_pressure_hpa.is_some())
+                        .count()
+                })
+                .sum();
+            annotated.hash(&mut h);
+            h.finish()
+        };
+        if self.st_cache.as_ref().is_some_and(|c| c.key == key) {
+            return;
+        }
+        let a = crate::structures::analyse(&self.tracks, &self.st_store, &self.st_params);
+        let hits = a.encounters.iter().map(|e| e.structure).collect();
+        let near = a
+            .per_fix
+            .iter()
+            .filter(|(_, v)| v.0 > 0)
+            .map(|(k, _)| *k)
+            .collect();
+        self.st_cache = Some(StCache { key, a, hits, near });
+    }
+
+    fn open_structures_dialog(&self, ctx: &egui::Context) {
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("Structure / turbine table", &["csv", "txt", "gz"])
+                .pick_file()
+            {
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match std::fs::read(&p) {
+                    Ok(bytes) => {
+                        let _ = tx.send(Msg::StructFile { name, bytes });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Status(format!("! {}: {e}", p.display())));
+                    }
+                }
+                ctx.request_repaint();
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(f) = rfd::AsyncFileDialog::new()
+                .add_filter("Structure / turbine table", &["csv", "txt", "gz"])
+                .pick_file()
+                .await
+            {
+                let bytes = f.read().await;
+                let _ = tx.send(Msg::StructFile {
+                    name: f.file_name(),
+                    bytes,
+                });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn structures_panel(&mut self, ui: &mut egui::Ui) {
+        use crate::structures::{self as st, Kind};
+        ui.checkbox(&mut self.st_on, "show & analyse")
+            .on_hover_text("Download wind turbines and tall structures along the tracks from OpenStreetMap and count encounters");
+        if !self.st_on {
+            ui.weak("Wind turbines and masts / towers / chimneys from OpenStreetMap, or a turbine register you import.");
+            return;
+        }
+        let items = &self.st_store.items;
+        let turb = items.iter().filter(|s| s.kind == Kind::WindTurbine).count();
+        let with_dims = items
+            .iter()
+            .filter(|s| s.kind == Kind::WindTurbine && !s.dims().3)
+            .count();
+        ui.label(format!(
+            "{turb} wind turbines ({with_dims} with hub height & rotor size) · {} other structures",
+            items.len() - turb
+        ));
+        if !self.st_queue.is_empty() || self.st_busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak(format!(
+                    "OpenStreetMap: {} request(s) to go",
+                    self.st_queue.len() + self.st_busy as usize
+                ));
+            });
+        }
+        if self.st_failed > 0 {
+            ui.colored_label(
+                Color32::from_rgb(255, 180, 80),
+                format!(
+                    "{} tile(s) failed to download - 'reload' retries",
+                    self.st_failed
+                ),
+            );
+        }
+        let p = &mut self.st_params;
+        ui.add(
+            egui::Slider::new(&mut p.radius_m, 100.0..=20_000.0)
+                .logarithmic(true)
+                .suffix(" m")
+                .text("encounter radius"),
+        )
+        .on_hover_text("A structure counts as encountered when a step (straight line between fixes) passes within this distance. Argos location errors are km-scale: see location_error_m in the export.");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut p.include_other, "masts, towers, chimneys");
+            ui.add_enabled(
+                p.include_other,
+                egui::Slider::new(&mut p.min_other_height_m, 0.0..=300.0)
+                    .suffix(" m")
+                    .text("min. height"),
+            );
+        });
+        ui.checkbox(&mut self.st_highlight, "highlight steps near turbines");
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("Import register CSV…")
+                .on_hover_text("Any table with latitude/longitude (+ height, hub_height, rotor_diameter): Marktstammdatenregister export, US Wind Turbine Database, a structures CSV from FinTrack…")
+                .clicked()
+            {
+                self.open_structures_dialog(ui.ctx());
+            }
+            if ui.button("reload").on_hover_text("Forget downloaded tiles and fetch again").clicked() {
+                self.st_store.clear();
+                self.st_failed = 0;
+                self.st_retry.clear();
+                self.st_planned = None;
+                self.st_queue.clear();
+            }
+        });
+        let Some(c) = &self.st_cache else {
+            return;
+        };
+        let sums = st::summaries(&self.tracks, &self.st_store, &c.a);
+        let total: usize = c.hits.len();
+        ui.label(format!(
+            "{total} structure(s) within {:.0} m of the tracks",
+            c.a.params.radius_m
+        ));
+        egui::ScrollArea::vertical().max_height(180.0).id_salt("st_sum").show(ui, |ui| {
+            egui::Grid::new("st_grid").striped(true).show(ui, |ui| {
+                ui.strong("track");
+                ui.strong("turbines");
+                ui.strong("/100 km");
+                ui.strong("nearest");
+                ui.strong("rotor zone").on_hover_text("Encounters with height above ground (tag pressure vs ERA5 surface pressure, needs Annotate) inside the rotor-swept band");
+                ui.end_row();
+                for sm in &sums {
+                    ui.label(&self.tracks[sm.track].id);
+                    ui.label(format!("{}{}", sm.turbines, if sm.other > 0 { format!(" (+{} other)", sm.other) } else { String::new() }));
+                    ui.label(format!("{:.1}", sm.per_100km));
+                    ui.label(sm.nearest_turbine_m.map(|d| format!("{d:.0} m")).unwrap_or("-".into()));
+                    ui.label(if sm.with_agl > 0 { format!("{}/{}", sm.in_rotor_zone, sm.with_agl) } else { "-".into() });
+                    ui.end_row();
+                }
+            });
+        });
+        let mut save: Option<(&str, String)> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("export:");
+            if ui.button("encounters").on_hover_text("One row per track × structure within the radius: distance, time, altitude, rotor zone, structure metadata").clicked() {
+                save = Some(("fintrack_encounters.csv", st::encounters_csv(&self.tracks, &self.st_store, &c.a)));
+            }
+            if ui.button("per-track summary").clicked() {
+                save = Some(("fintrack_structure_summary.csv", st::summary_csv(&self.tracks, &self.st_store, &c.a)));
+            }
+            if ui.button("structures").on_hover_text("All loaded turbines / structures (re-importable)").clicked() {
+                save = Some(("fintrack_structures.csv", st::structures_csv(&self.st_store)));
+            }
+        });
+        ui.weak("Per-fix counts (turbines_within_radius, nearest_turbine_m) are added to the annotated CSV export. Structures © OpenStreetMap contributors (ODbL).");
+        if let Some((name, csv)) = save {
+            self.save_csv(name, csv);
+        }
+    }
+
+    // ------------------------------------------------------------------ video
+
+    fn capture_rect(&self) -> Rect {
+        if self.video.include_timeline && self.timeline_rect.is_positive() {
+            self.map_rect.union(self.timeline_rect)
+        } else {
+            self.map_rect
+        }
+    }
+
+    /// (start, end, tracking seconds per frame, frame count)
+    fn video_plan(&self) -> (f64, f64, f64, usize) {
+        let dt = SPEEDS[self.video.speed_idx].0 / self.video.effective_fps() as f64;
+        let t0 = if self.video.from_cursor {
+            self.t_now
+        } else {
+            self.t_min
+        };
+        let total = ((self.t_max - t0).max(0.0) / dt).floor() as usize + 1;
+        (t0, self.t_max, dt, total)
+    }
+
+    fn start_recording(&mut self, ctx: &egui::Context) {
+        let rect = self.capture_rect();
+        if !rect.is_positive() {
+            self.status("! video: nothing to capture");
+            return;
+        }
+        let (t0, t_end, dt, total) = self.video_plan();
+        let (fmt, fps) = (self.video.format, self.video.effective_fps());
+        #[cfg(not(target_arch = "wasm32"))]
+        let (sink, name) = {
+            let Some(path) = rfd::FileDialog::new()
+                .set_file_name(format!("fintrack.{}", fmt.ext()))
+                .add_filter(fmt.label(), &[fmt.ext()])
+                .save_file()
+            else {
+                return;
+            };
+            let name = path.display().to_string();
+            (video::Sink::new(fmt, fps, path), name)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let (sink, name) = (
+            video::Sink::new(fmt, fps),
+            format!("fintrack.{}", fmt.ext()),
+        );
+        let (shot_tx, shot_rx) = channel();
+        self.playing = false;
+        self.video_dialog = false;
+        self.t_now = t0;
+        self.status(format!("Recording {total} frames to {name}…"));
+        self.rec = Some(Recording {
+            sink,
+            shot_tx,
+            shot_rx,
+            rect,
+            downscale: self.video.downscale,
+            t: t0,
+            t_end,
+            dt,
+            waiting: false,
+            warmup: 60,
+            frames: 0,
+            total,
+            name,
+        });
+        ctx.request_repaint();
+    }
+
+    /// One step of the capture loop: collect a finished screenshot, advance the clock, and
+    /// request the next one. Runs before the UI so the requested frame shows the new time.
+    fn record_tick(&mut self, ctx: &egui::Context) {
+        let Some(mut rec) = self.rec.take() else {
+            return;
+        };
+        self.playing = false;
+        let ppp = ctx.pixels_per_point();
+        let px = [
+            (rec.rect.min.x * ppp).round() as usize,
+            (rec.rect.min.y * ppp).round() as usize,
+            (rec.rect.width() * ppp).round() as usize,
+            (rec.rect.height() * ppp).round() as usize,
+        ];
+        let mut done: Option<Result<(), String>> = None;
+        while let Ok(img) = rec.shot_rx.try_recv() {
+            match video::prepare(&img, px, rec.downscale).and_then(|f| rec.sink.push(f)) {
+                Ok(()) => {
+                    rec.frames += 1;
+                    rec.waiting = false;
+                    rec.t += rec.dt;
+                }
+                Err(e) => {
+                    done = Some(Err(e));
+                    break;
+                }
+            }
+        }
+        if done.is_none() && !rec.waiting {
+            if rec.warmup > 0 {
+                rec.warmup -= 1;
+                self.t_now = rec.t;
+                ctx.request_repaint();
+            } else {
+                self.t_now = rec.t;
+                if self.skip_daytime {
+                    self.skip_to_night();
+                    rec.t = self.t_now;
+                }
+                if rec.t > rec.t_end {
+                    done = Some(Ok(()));
+                } else {
+                    let tx = rec.shot_tx.clone();
+                    let c = ctx.clone();
+                    ctx.request_screenshot(move |img| {
+                        let _ = tx.send(img);
+                        c.request_repaint();
+                    });
+                    rec.waiting = true;
+                }
+            }
+        }
+        match done {
+            None => self.rec = Some(rec),
+            Some(r) => self.finish_recording(rec, r, ctx),
+        }
+    }
+
+    fn finish_recording(&mut self, rec: Recording, r: Result<(), String>, ctx: &egui::Context) {
+        let Recording {
+            sink, name, frames, ..
+        } = rec;
+        if let Err(e) = r {
+            self.status(format!("! video export failed: {e}"));
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::spawn(move || drop(sink.finish()));
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.status(format!("Finishing video ({frames} frames)…"));
+            let tx = self.tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let msg = match sink.finish() {
+                    Ok(()) => format!("Saved video {name} ({frames} frames)"),
+                    Err(e) => format!("! video export failed: {e}"),
+                };
+                let _ = tx.send(Msg::Status(msg));
+                ctx.request_repaint();
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ctx;
+            let msg = match sink
+                .finish()
+                .and_then(|b| web_download(&name, &b, "image/gif"))
+            {
+                Ok(()) => format!("Downloaded {name} ({frames} frames)"),
+                Err(e) => format!("! video export failed: {e}"),
+            };
+            self.status(msg);
+        }
+    }
+
+    fn open_video_dialog(&mut self) {
+        self.video_dialog = true;
+        self.video.speed_idx = self.speed_idx;
+        if self.ffmpeg.is_none() {
+            let ok = video::ffmpeg_available();
+            self.ffmpeg = Some(ok);
+            if ok {
+                self.video.format = video::Format::Mp4;
+            }
+        }
+    }
+
+    fn video_window(&mut self, ctx: &egui::Context) {
+        if !self.video_dialog {
+            return;
+        }
+        let mut open = true;
+        let mut start = false;
+        egui::Window::new("Export video")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let ffmpeg = self.ffmpeg.unwrap_or(false);
+                egui::ComboBox::from_label("format")
+                    .selected_text(self.video.format.label())
+                    .show_ui(ui, |ui| {
+                        ui.add_enabled_ui(ffmpeg, |ui| {
+                            ui.selectable_value(&mut self.video.format, video::Format::Mp4, video::Format::Mp4.label())
+                        })
+                        .response
+                        .on_disabled_hover_text(if cfg!(target_arch = "wasm32") {
+                            "MP4 needs the desktop app"
+                        } else {
+                            "ffmpeg was not found on PATH"
+                        });
+                        ui.selectable_value(&mut self.video.format, video::Format::Gif, video::Format::Gif.label());
+                    });
+                ui.add(egui::Slider::new(&mut self.video.fps, 5..=60).text("frames per second"));
+                if self.video.effective_fps() != self.video.fps {
+                    ui.weak(format!("GIF is limited to {} fps", self.video.effective_fps()));
+                }
+                egui::ComboBox::from_label("tracking time per video second")
+                    .selected_text(SPEEDS[self.video.speed_idx].1)
+                    .show_ui(ui, |ui| {
+                        for (i, s) in SPEEDS.iter().enumerate() {
+                            ui.selectable_value(&mut self.video.speed_idx, i, s.1);
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.video.from_cursor, false, "whole timeline");
+                    ui.radio_value(&mut self.video.from_cursor, true, "from cursor to end");
+                });
+                let res = |k: usize| match k {
+                    1 => "full",
+                    2 => "1/2",
+                    _ => "1/3",
+                };
+                egui::ComboBox::from_label("resolution")
+                    .selected_text(res(self.video.downscale))
+                    .show_ui(ui, |ui| {
+                        for k in 1..=3 {
+                            ui.selectable_value(&mut self.video.downscale, k, res(k));
+                        }
+                    });
+                ui.checkbox(&mut self.video.include_timeline, "include timeline & sensor chart");
+                ui.separator();
+                let r = self.capture_rect();
+                let ppp = ctx.pixels_per_point();
+                let k = self.video.downscale as f32;
+                let (_, _, _, total) = self.video_plan();
+                ui.label(format!(
+                    "{total} frames · {:.1} s of video · {}×{} px",
+                    total as f32 / self.video.effective_fps() as f32,
+                    ((r.width() * ppp / k) as u32) & !1,
+                    ((r.height() * ppp / k) as u32) & !1,
+                ));
+                if self.skip_daytime {
+                    ui.weak("“skip daytime” is on: day hours are left out, so the video will be shorter.");
+                }
+                if total > 5000 {
+                    ui.colored_label(Color32::from_rgb(255, 180, 80), "That's a lot of frames — pick a faster speed?");
+                }
+                ui.weak(
+                    "Records the map (basemap, satellite layer, wind field, legend) as currently shown. \
+                     Set zoom and layers first and keep the window size fixed while recording.",
+                );
+                if ui.add_enabled(total > 0, egui::Button::new("Start recording")).clicked() {
+                    start = true;
+                }
+            });
+        self.video_dialog = open && !start;
+        if start {
+            self.start_recording(ctx);
+        }
+    }
+
+    // ------------------------------------------------------------------ weather
+
+    fn start_weather(&mut self) {
+        let pts = weather::sample_points(&self.tracks, &self.opts);
+        // The wind field around the animals is fetched lazily for the days in view.
+        self.surface_field_on = true;
+        self.surface_field_days.clear();
+        if self.era5_source == Era5Source::Cds {
+            if self.cds_key.trim().is_empty() {
+                self.status(
+                    "! Copernicus CDS selected but no API key entered (Wind & weather → Download & annotate → ERA5 source)"
+                        .to_string(),
+                );
+                return;
+            }
+            let jobs = crate::cds::plan(&pts, &self.store.days, weather::latest_available_day());
+            if jobs.is_empty() {
+                let n = weather::annotate(&mut self.tracks, &self.store, &self.opts);
+                self.status(format!("ERA5: everything cached - annotated {n} fixes"));
+                return;
+            }
+            self.status(format!(
+                "ERA5 via Copernicus CDS: {} grid-cell job(s) for {} sample points (each takes ~10–60 s at CDS; {CDS_PARALLEL} at a time)",
+                jobs.len(),
+                pts.len()
+            ));
+            self.reset_counters_if_idle();
+            self.req_total += jobs.len();
+            self.cds_pending.extend(jobs);
+            return;
+        }
+        self.maybe_request_surface_field();
+        let reqs = self
+            .store
+            .plan(&pts, self.opts.model, weather::latest_available_day());
+        if reqs.is_empty() {
+            let n = weather::annotate(&mut self.tracks, &self.store, &self.opts);
+            self.status(format!("ERA5: everything cached - annotated {n} fixes"));
+            return;
+        }
+        self.status(format!(
+            "ERA5: {} request(s) for {} sample points ({} days lag; Open-Meteo, free for non-commercial use)",
+            reqs.len(),
+            pts.len(),
+            6
+        ));
+        // Annotation first: wind-field windows queued earlier can wait.
+        self.enqueue_front(reqs.into_iter().map(Job::Surface).collect());
+    }
+
+    fn downloads_idle(&self) -> bool {
+        self.queue.is_empty()
+            && self.in_flight.is_empty()
+            && self.cds_pending.is_empty()
+            && self.cds_running.is_empty()
+    }
+
+    fn reset_counters_if_idle(&mut self) {
+        if self.downloads_idle() {
+            self.req_total = 0;
+            self.req_done = 0;
+            self.req_failed = 0;
+        }
+    }
+
+    fn enqueue(&mut self, jobs: Vec<Job>) {
+        if jobs.is_empty() {
+            return;
+        }
+        self.reset_counters_if_idle();
+        self.req_total += jobs.len();
+        self.queue.extend(jobs);
+    }
+
+    fn enqueue_front(&mut self, jobs: Vec<Job>) {
+        if jobs.is_empty() {
+            return;
+        }
+        self.reset_counters_if_idle();
+        self.req_total += jobs.len();
+        for j in jobs.into_iter().rev() {
+            self.queue.push_front(j);
+        }
+    }
+
+    // ------------------------------------------------------------------ 3D wind
+
+    /// Default display levels: those closest to ~300, 800 and 1500 m (standard atmosphere).
+    fn reset_display_levels(&mut self) {
+        let lv = &self.profiles.levels;
+        let mut out: Vec<usize> = Vec::new();
+        for h in [300.0, 800.0, 1500.0] {
+            if let Some(i) = (0..lv.len()).min_by(|&a, &b| {
+                let ha = geo::pressure_to_altitude_m(lv[a] as f64, 1013.25);
+                let hb = geo::pressure_to_altitude_m(lv[b] as f64, 1013.25);
+                (ha - h).abs().total_cmp(&(hb - h).abs())
+            }) && !out.contains(&i)
+            {
+                out.push(i);
+            }
+        }
+        out.sort_unstable();
+        self.display_levels = out;
+        self.view3d.raster_level = 0;
+        self.slice_cache = None;
+        self.curtain_cache = None;
+    }
+
+    fn ensure_open_meteo(&mut self) {
+        if !matches!(
+            self.profiles.source,
+            wind3d::Source::File(_) | wind3d::Source::Synthetic
+        ) {
+            let before = self.profiles.levels.len();
+            self.profiles.use_open_meteo(self.om_model);
+            self.profiles.node_step = self.field_step_cells;
+            if before != self.profiles.levels.len() || self.display_levels.is_empty() {
+                self.reset_display_levels();
+            }
+        }
+    }
+
+    /// Bounding box of the visible tracks plus a margin, limited to 30° × 40°.
+    /// Box around where the visible animals are at the cursor time (held 12 h past the
+    /// ends of each track), padded by the 3D field radius and limited to 30° × 40°.
+    fn field_bbox(&self) -> Option<(f64, f64, f64, f64)> {
+        let t = self.t_now;
+        let (mut s, mut n, mut w, mut e) = (90.0f64, -90.0f64, 180.0f64, -180.0f64);
+        let mut any = false;
+        for tr in self.tracks.iter().filter(|t| t.visible) {
+            let Some((t0, t1)) = tr.time_range() else {
+                continue;
+            };
+            if t < t0 as f64 - 43_200.0 || t > t1 as f64 + 43_200.0 {
+                continue;
+            }
+            if let Some((la, lo, _)) = tr.position_at(t.clamp(t0 as f64, t1 as f64)) {
+                s = s.min(la);
+                n = n.max(la);
+                w = w.min(lo);
+                e = e.max(lo);
+                any = true;
+            }
+        }
+        if !any {
+            return None;
+        }
+        let m = self.field_radius_deg as f64;
+        let (s, n, w, e) = (
+            (s - m).max(-85.0),
+            (n + m).min(85.0),
+            (w - m).max(-180.0),
+            (e + m).min(180.0),
+        );
+        let (cl, co) = ((s + n) / 2.0, (w + e) / 2.0);
+        Some((
+            s.max(cl - 15.0),
+            n.min(cl + 15.0),
+            w.max(co - 20.0),
+            e.min(co + 20.0),
+        ))
+    }
+
+    fn start_profiles(&mut self) {
+        self.ensure_open_meteo();
+        if matches!(
+            self.profiles.source,
+            wind3d::Source::File(_) | wind3d::Source::Synthetic
+        ) {
+            let n = wind3d::annotate(&mut self.tracks, &self.profiles);
+            self.status(format!("3D wind (file): annotated {n} fixes"));
+            return;
+        }
+        let pts = wind3d::annotation_points(&self.tracks, true, self.opts.max_segment_h);
+        let early = wind3d::too_early(&pts);
+        if early > 0 {
+            self.status(format!(
+                "! 3D wind: Open-Meteo has pressure levels only from 2016-01-01 - {} of {} points are earlier. \
+                 For older tracks export an ERA5 pressure-level cube (tools/era5_wind_cube.py, CDS) and use 'Import ERA5 cube…'.",
+                early,
+                pts.len()
+            ));
+        }
+        let reqs = self.profiles.plan(&pts, wind3d::latest_available_day());
+        if reqs.is_empty() && early == pts.len() {
+            return;
+        }
+        if reqs.is_empty() {
+            let n = wind3d::annotate(&mut self.tracks, &self.profiles);
+            self.status(format!("3D wind: everything cached - annotated {n} fixes"));
+            return;
+        }
+        self.status(format!(
+            "3D wind: {} request(s) along the tracks ({} levels, {})",
+            reqs.len(),
+            self.profiles.levels.len(),
+            self.profiles.source.label()
+        ));
+        // along-track annotation before the fields around the animals
+        self.enqueue_front(reqs.into_iter().map(Job::Profile).collect());
+    }
+
+    /// Key that changes when the set of visible tracks changes (field windows depend on it).
+    fn visible_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (i, t) in self.tracks.iter().enumerate() {
+            if t.visible {
+                (i, &t.id, t.fixes.len()).hash(&mut h);
+            }
+        }
+        h.finish()
+    }
+
+    /// Days to request next: the cursor day, or two days ahead if that is already covered,
+    /// so playback prefetches. Returns the first day of a 7-day window not yet requested.
+    fn next_window_day(&self, done: &HashSet<(i64, u64)>) -> Option<i64> {
+        let key = self.visible_key();
+        let day = weather::day_of(self.t_now as i64);
+        [day, day + 2]
+            .into_iter()
+            .find(|d| !done.contains(&(*d, key)))
+    }
+
+    /// Lazily download the 3D field around the animals for the week from the cursor day
+    /// (Open-Meteo only). A cell needed on several days costs one call (≤ 14 days).
+    fn maybe_request_field(&mut self) {
+        if !self.field_auto
+            || self.tracks.is_empty()
+            || matches!(
+                self.profiles.source,
+                wind3d::Source::File(_) | wind3d::Source::Synthetic
+            )
+            || self.queue.len() > 20
+        {
+            return;
+        }
+        self.ensure_open_meteo();
+        let Some(day) = self.next_window_day(&self.field_days_requested) else {
+            return;
+        };
+        let key = self.visible_key();
+        for d in day..day + 7 {
+            self.field_days_requested.insert((d, key));
+        }
+        let pts = weather::window_points(
+            &self.tracks,
+            day,
+            7,
+            self.field_radius_deg as f64,
+            self.profiles.node_step,
+        );
+        let reqs = self.profiles.plan(&pts, wind3d::latest_available_day());
+        if !reqs.is_empty() {
+            let w: f32 = reqs.iter().map(|r| r.weight()).sum();
+            self.status(format!(
+                "3D wind around the animals, {} – {}: {} request(s), ≈{w:.0} API calls",
+                weather::day_str(day),
+                weather::day_str(day + 6),
+                reqs.len()
+            ));
+            self.enqueue(reqs.into_iter().map(Job::Profile).collect());
+        }
+    }
+
+    /// Same for the 2D (surface ERA5) wind field, once the user has annotated at least once.
+    fn maybe_request_surface_field(&mut self) {
+        let layers = self.wx_field != crate::wxfield::FieldVar::Off
+            || self.wx_isobars
+            || self.wx_centres
+            || self.view3d.show_clouds;
+        if !(self.surface_field_on || layers)
+            || !(self.show_wind_field || layers)
+            || self.opts.field_margin_deg <= 0.0
+            || self.tracks.is_empty()
+            || self.queue.len() > 20
+        {
+            return;
+        }
+        let Some(day) = self.next_window_day(&self.surface_field_days) else {
+            return;
+        };
+        let key = self.visible_key();
+        for d in day..day + 7 {
+            self.surface_field_days.insert((d, key));
+        }
+        let pts = weather::window_points(
+            &self.tracks,
+            day,
+            7,
+            self.opts.field_margin_deg as f64,
+            self.opts.field_stride,
+        );
+        let reqs = self
+            .store
+            .plan(&pts, self.opts.model, weather::latest_available_day());
+        if !reqs.is_empty() {
+            let w: f32 = reqs.iter().map(|r| r.weight()).sum();
+            self.status(format!(
+                "ERA5 wind field around the animals, {} – {}: {} request(s), ≈{w:.0} API calls",
+                weather::day_str(day),
+                weather::day_str(day + 6),
+                reqs.len()
+            ));
+            self.enqueue(reqs.into_iter().map(Job::Surface).collect());
+        }
+    }
+
+    fn current_slice(&mut self) -> Option<&FieldSlice> {
+        let bbox = self.field_bbox()?;
+        if self.profiles.is_empty() || self.display_levels.is_empty() {
+            return None;
+        }
+        let q = |x: f64| (x * 4.0).round() as i32;
+        let key: SliceKey = (
+            (self.t_now as i64) / 300,
+            self.profiles.generation,
+            self.display_levels.clone(),
+            (q(bbox.0), q(bbox.1), q(bbox.2), q(bbox.3)),
+        );
+        if self.slice_cache.as_ref().is_none_or(|c| c.0 != key) {
+            let slice = FieldSlice::build(
+                &self.profiles,
+                &self.display_levels,
+                bbox,
+                self.t_now as i64,
+            );
+            self.slice_cache = Some((key, slice));
+        }
+        self.slice_cache.as_ref().and_then(|c| c.1.as_ref())
+    }
+
+    /// Track used by single-track charts: isolated track, else selected fix's track, else first visible.
+    fn chart_track(&self) -> Option<usize> {
+        self.selected_track
+            .or(self.selected.map(|s| s.0))
+            .or_else(|| self.tracks.iter().position(|t| t.visible))
+    }
+
+    fn pump_weather(&mut self, ctx: &egui::Context) {
+        // Stay under Open-Meteo's free limits (600 calls/min, 5000/h) with some headroom.
+        const PER_MIN: f32 = 450.0;
+        const PER_HOUR: f32 = 4200.0;
+        let now = self.now;
+        while self.sent_log.front().is_some_and(|(t, _)| now - t > 3600.0) {
+            self.sent_log.pop_front();
+        }
+        // Watchdog: a request that never answers would otherwise block the queue forever.
+        let stale: Vec<usize> = self
+            .in_flight_t
+            .iter()
+            .filter(|(_, t)| now - **t > OM_TIMEOUT_S)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            self.in_flight_t.remove(&id);
+            if let Some(job) = self.in_flight.remove(&id) {
+                let n = self.retries.entry(job.url().to_string()).or_insert(0);
+                *n += 1;
+                if *n <= 2 {
+                    self.status(format!(
+                        "Open-Meteo did not answer within {OM_TIMEOUT_S:.0} s - retrying"
+                    ));
+                    self.queue.push_front(job);
+                } else {
+                    self.req_done += 1;
+                    self.req_failed += 1;
+                    match &job {
+                        Job::Surface(req) => self.store.mark_done(req),
+                        Job::Profile(req) => self.profiles.mark_done(req),
+                    }
+                    self.status("! Open-Meteo request timed out repeatedly - skipped".to_string());
+                    self.on_download_complete();
+                }
+            }
+        }
+        if !self.queue.is_empty() && now < self.om_blocked_until {
+            let n = self.queue.len();
+            self.queue.clear();
+            self.req_done += n;
+            self.req_failed += n;
+            self.wait_note = None;
+            self.on_download_complete();
+            return;
+        }
+        if now < self.pause_until {
+            self.wait_note = Some(format!(
+                "Open-Meteo busy (overloaded / rate limit): resuming in {:.0} s, {} at a time",
+                self.pause_until - now,
+                self.om_parallel
+            ));
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+        self.wait_note = None;
+        // A key raises the limits a lot; keep a (looser) budget anyway.
+        let scale = if self.om_key.trim().is_empty() {
+            1.0
+        } else {
+            10.0
+        };
+        while self.in_flight.len() < self.om_parallel {
+            let Some(w) = self.queue.front().map(|j| j.weight()) else {
+                break;
+            };
+            let minute: f32 = self
+                .sent_log
+                .iter()
+                .filter(|(t, _)| now - t < 60.0)
+                .map(|x| x.1)
+                .sum();
+            let hour: f32 = self.sent_log.iter().map(|x| x.1).sum();
+            // A single request heavier than the budget may still go when nothing else is pending.
+            let empty_min = minute == 0.0;
+            if (minute + w > PER_MIN * scale && !empty_min) || hour + w > PER_HOUR * scale {
+                self.wait_note = Some(if hour + w > PER_HOUR * scale {
+                    format!(
+                        "waiting for the hourly Open-Meteo budget ({hour:.0} of {:.0} calls used in the last hour; free limit 5 000/h per IP)",
+                        PER_HOUR * scale
+                    )
+                } else {
+                    format!("pacing requests ({minute:.0} calls in the last minute)")
+                });
+                ctx.request_repaint_after(std::time::Duration::from_secs(2));
+                break;
+            }
+            let Some(req) = self.queue.pop_front() else {
+                break;
+            };
+            self.sent_log.push_back((now, w));
+            let id = self.next_req_id;
+            self.next_req_id += 1;
+            let tx = self.tx.clone();
+            let ctx2 = ctx.clone();
+            let mut http = ehttp::Request::get(om_url(req.url(), &self.om_key));
+            http.timeout = Some(std::time::Duration::from_secs_f64(OM_TIMEOUT_S));
+            self.in_flight_t.insert(id, now);
+            ehttp::fetch(http, move |res| {
+                let result = match res {
+                    Ok(r) if r.ok => r
+                        .text()
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| "non-UTF8 body".to_string()),
+                    Ok(r) => Err(format!(
+                        "HTTP {} {}",
+                        r.status,
+                        r.text()
+                            .map(|t| t.chars().take(200).collect::<String>())
+                            .unwrap_or_default()
+                    )),
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send(Msg::Weather { id, result });
+                ctx2.request_repaint();
+            });
+            self.in_flight.insert(id, req);
+        }
+    }
+
+    fn process_messages(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                Msg::File { name, bytes } => self.add_file(name, bytes, None),
+                Msg::RemoteFile {
+                    url,
+                    bytes,
+                    force,
+                    from_share,
+                } => {
+                    let name = share::file_name_from_url(&url);
+                    self.add_file_from(name, bytes, force.as_deref(), Some(FileOrigin::Url(url)));
+                    if from_share {
+                        self.share_file_arrived();
+                    }
+                }
+                Msg::FetchFailed {
+                    url,
+                    err,
+                    from_share,
+                } => {
+                    self.status(format!("! could not download {url}: {err}"));
+                    if from_share {
+                        self.share_file_arrived();
+                    }
+                }
+                Msg::Status(s) => self.status(s),
+                Msg::Weather { id, result } => {
+                    let Some(job) = self.in_flight.remove(&id) else {
+                        continue;
+                    };
+                    self.in_flight_t.remove(&id);
+                    let res: Result<(), String> = result.and_then(|body| match &job {
+                        Job::Surface(req) => self.store.ingest(req, &body).map(|_| ()),
+                        Job::Profile(req) => self.profiles.ingest(req, &body).map(|_| ()),
+                    });
+                    match res {
+                        Ok(()) => {
+                            self.om_ok_streak += 1;
+                            if self.om_ok_streak >= 5 {
+                                self.om_parallel = OM_PARALLEL;
+                            }
+                            self.retries.remove(job.url());
+                            self.req_done += 1;
+                        }
+                        Err(e) => match om_failure(&e) {
+                            OmFailure::Daily => {
+                                // Nothing will succeed before midnight UTC: stop instead of retrying.
+                                let day = 86_400.0;
+                                let wall = chrono::Utc::now().timestamp() as f64;
+                                self.om_blocked_until =
+                                    self.now + (day - wall.rem_euclid(day)) + 60.0;
+                                self.queue.push_front(job);
+                                self.status(
+                                    "! Open-Meteo daily limit (10 000 calls) reached for your IP address - it is shared by everyone on your network. \
+                                     Remaining requests skipped. Try again after midnight UTC, enter an Open-Meteo API key, or switch the ERA5 source to Copernicus CDS."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
+                            OmFailure::Hourly => {
+                                let wall = chrono::Utc::now().timestamp() as f64;
+                                let wait = 3600.0 - wall.rem_euclid(3600.0) + 30.0;
+                                self.pause_until = self.now + wait;
+                                self.queue.push_front(job);
+                                self.status(format!(
+                                    "Open-Meteo hourly limit reached for your IP - waiting {:.0} min for the next hour",
+                                    wait / 60.0
+                                ));
+                                continue;
+                            }
+                            OmFailure::Transient { minute } => {
+                                // Overloaded / unreachable / rate-limited this minute: back off
+                                // (for everything: the server is busy), slow down, retry later.
+                                self.om_ok_streak = 0;
+                                self.om_parallel = 1;
+                                let n = {
+                                    let n = self.retries.entry(job.url().to_string()).or_insert(0);
+                                    *n += 1;
+                                    *n
+                                };
+                                if n <= OM_RETRIES {
+                                    let wait = if minute {
+                                        65.0
+                                    } else {
+                                        (20.0 * 2f64.powi(n as i32 - 1)).min(600.0)
+                                    };
+                                    self.pause_until = self.pause_until.max(self.now + wait);
+                                    self.queue.push_front(job);
+                                    self.status(format!(
+                                        "Open-Meteo: {} - retry {n}/{OM_RETRIES} in {wait:.0} s",
+                                        short_err(&e)
+                                    ));
+                                    continue;
+                                }
+                                self.req_done += 1;
+                                self.req_failed += 1;
+                                self.failed_jobs.push(job);
+                                self.status(format!(
+                                    "! weather request failed {OM_RETRIES} times ({}) - kept for 'Retry failed'",
+                                    short_err(&e)
+                                ));
+                            }
+                            OmFailure::Permanent => {
+                                self.req_done += 1;
+                                self.req_failed += 1;
+                                match &job {
+                                    Job::Surface(req) => self.store.mark_done(req),
+                                    Job::Profile(req) => self.profiles.mark_done(req),
+                                }
+                                self.status(format!(
+                                    "! weather request rejected: {}",
+                                    short_err(&e)
+                                ));
+                            }
+                        },
+                    }
+                    self.on_download_complete();
+                }
+                Msg::Cds { run, result } => self.on_cds_response(run, result),
+                Msg::Overpass { tiles, result } => self.on_overpass(tiles, result),
+                Msg::Cyclones {
+                    name,
+                    result,
+                    year: Some(_),
+                } => self.on_cyclone_year(&name, result, ctx),
+                Msg::Cyclones { name, result, .. } => {
+                    self.storms_busy = false;
+                    match result {
+                        Ok(bytes) => match crate::cyclones::parse(&name, &bytes, None) {
+                            Ok(v) => {
+                                let names: Vec<String> = v.iter().map(|s| s.label()).collect();
+                                self.storms = v;
+                                self.storms_on = true;
+                                self.status(format!(
+                                    "Tropical cyclones (IBTrACS): {} storm(s) - {}",
+                                    names.len(),
+                                    names.join(", ")
+                                ));
+                            }
+                            Err(e) => self.status(format!("! {name}: {e}")),
+                        },
+                        // ERDDAP answers 404 when nothing matches the query
+                        Err(e) if e.starts_with("HTTP 404") => {
+                            self.storms.clear();
+                            self.status("IBTrACS: no tropical cyclones in the tracks' time window and area".to_string());
+                        }
+                        Err(e) => self.status(format!(
+                            "! IBTrACS download failed ({e}) - download a CSV from NCEI ({}) and use 'Import IBTrACS CSV…'",
+                            crate::cyclones::NCEI_PAGE
+                        )),
+                    }
+                }
+                Msg::Marine { req, tries, result } => self.on_marine(req, tries, result),
+                Msg::StructFile { name, bytes } => {
+                    match crate::table::Table::from_bytes(&name, &bytes)
+                        .and_then(|t| crate::structures::from_table(&t))
+                    {
+                        Ok(v) => {
+                            let n = v.len();
+                            let new = self.st_store.add(v);
+                            self.st_on = true;
+                            self.status(format!(
+                                "{name}: imported {n} structures ({new} new) - kept alongside OpenStreetMap"
+                            ));
+                        }
+                        Err(e) => self.status(format!("! {name}: {e}")),
+                    }
+                }
+            }
+        }
+    }
+
+    /// After each finished download: annotate every few results and once at the end.
+    fn on_download_complete(&mut self) {
+        self.since_annotate += 1;
+        let finished = self.downloads_idle();
+        if finished || self.since_annotate >= 4 {
+            let n = weather::annotate(&mut self.tracks, &self.store, &self.opts);
+            let n3 = if self.profiles.is_empty() {
+                0
+            } else {
+                wind3d::annotate(&mut self.tracks, &self.profiles)
+            };
+            self.since_annotate = 0;
+            self.curtain_cache = None;
+            if finished {
+                self.status(format!(
+                                "Downloads done: surface {} cells / {} h ({n} fixes), pressure levels {} cells / {} h ({n3} fixes){}",
+                                self.store.cells.len(),
+                                self.store.hours(),
+                                self.profiles.cells.len(),
+                                self.profiles.hours(),
+                                if self.req_failed > 0 {
+                                    format!(" ({} requests failed)", self.req_failed)
+                                } else {
+                                    String::new()
+                                }
+                            ));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ Copernicus CDS
+
+    /// Data source picker and API keys (keys are stored on this device only).
+    fn era5_source_ui(&mut self, ui: &mut egui::Ui) {
+        let before = self.era5_source;
+        egui::ComboBox::from_label("ERA5 source")
+            .selected_text(self.era5_source.label())
+            .show_ui(ui, |ui| {
+                for s in [Era5Source::OpenMeteo, Era5Source::Cds] {
+                    ui.selectable_value(&mut self.era5_source, s, s.label());
+                }
+            });
+        if before != self.era5_source {
+            crate::prefs::save(
+                "era5_source",
+                if self.era5_source == Era5Source::Cds {
+                    "cds"
+                } else {
+                    ""
+                },
+            );
+        }
+        let show = self.show_keys;
+        let key_field = |ui: &mut egui::Ui, v: &mut String, hint: &str| {
+            ui.add(
+                egui::TextEdit::singleline(v)
+                    .password(!show)
+                    .hint_text(hint)
+                    .desired_width(210.0),
+            )
+            .changed()
+        };
+        match self.era5_source {
+            Era5Source::Cds => {
+                ui.horizontal(|ui| {
+                    ui.label("CDS API key");
+                    if key_field(ui, &mut self.cds_key, "personal access token") {
+                        crate::prefs::save("cds_key", self.cds_key.trim());
+                    }
+                    ui.toggle_value(&mut self.show_keys, "👁")
+                        .on_hover_text("Show / hide the key");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.hyperlink_to("get your key", crate::cds::PROFILE_PAGE);
+                    ui.label("·");
+                    ui.hyperlink_to(
+                        "accept the ERA5 time-series licence (once)",
+                        crate::cds::DATASET_PAGE,
+                    );
+                });
+                ui.weak(
+                    "Uses your own CDS quota (ERA5 hourly time series, one job per 0.25° cell; ~10–60 s each). \
+                     Point annotation only: wind-field arrows and 3D wind still come from Open-Meteo. \
+                     This dataset has no 100 m wind or cloud cover, so wind support uses 10 m wind. \
+                     The key is stored only on this device, never in share links.",
+                );
+            }
+            Era5Source::OpenMeteo => {
+                egui::CollapsingHeader::new("Open-Meteo API key (optional)").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if key_field(ui, &mut self.om_key, "paid-plan key") {
+                            crate::prefs::save("open_meteo_key", self.om_key.trim());
+                        }
+                        ui.toggle_value(&mut self.show_keys, "👁");
+                    });
+                    ui.weak(
+                        "Free use is limited per IP address (600/min, 5 000/h, 10 000/day), shared by everyone on \
+                         your network. A key (open-meteo.com/en/pricing) switches to the customer servers. \
+                         Stored on this device only.",
+                    );
+                });
+            }
+        }
+    }
+
+    /// Start queued CDS jobs and send the next request of each running one.
+    fn pump_cds(&mut self, ctx: &egui::Context) {
+        while self.cds_running.len() < CDS_PARALLEL
+            && let Some(job) = self.cds_pending.pop_front()
+        {
+            self.cds_next_id += 1;
+            self.cds_running.push(CdsRun {
+                id: self.cds_next_id,
+                job,
+                stage: CdsStage::Submit,
+                busy: false,
+                next_at: 0.0,
+                polls: 0,
+            });
+        }
+        let now = self.now;
+        let key = self.cds_key.clone();
+        for r in self.cds_running.iter_mut().filter(|r| !r.busy) {
+            if now < r.next_at {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(r.next_at - now));
+                continue;
+            }
+            let req = match &r.stage {
+                CdsStage::Submit => crate::cds::submit(&key, &r.job),
+                CdsStage::Poll(id) => crate::cds::status(&key, id),
+                CdsStage::Results(id) => crate::cds::results(&key, id),
+                // the download link is pre-signed: no key header
+                CdsStage::Download(href) => ehttp::Request::get(href),
+            };
+            r.busy = true;
+            let (tx, ctx2, run) = (self.tx.clone(), ctx.clone(), r.id);
+            ehttp::fetch(req, move |res| {
+                let result = res.map(|r| (r.status, r.bytes));
+                let _ = tx.send(Msg::Cds { run, result });
+                ctx2.request_repaint();
+            });
+        }
+    }
+
+    fn on_cds_response(&mut self, run: u64, result: Result<(u16, Vec<u8>), String>) {
+        let Some(i) = self.cds_running.iter().position(|r| r.id == run) else {
+            return;
+        };
+        self.cds_running[i].busy = false;
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let step: Result<Option<CdsStage>, String> = match result {
+            Err(e) => {
+                if matches!(self.cds_running[i].stage, CdsStage::Submit) && self.req_done == 0 {
+                    // First contact failed without any HTTP status: blocked or offline.
+                    Err(format!(
+                        "could not reach the Copernicus CDS ({e}). {}",
+                        if cfg!(target_arch = "wasm32") {
+                            "The browser may block calls to cds.climate.copernicus.eu from other web sites (CORS); the desktop app is not affected."
+                        } else {
+                            "Check the internet connection."
+                        }
+                    ))
+                } else {
+                    Err(e)
+                }
+            }
+            Ok((401 | 403, b)) if matches!(self.cds_running[i].stage, CdsStage::Submit) => {
+                let msg = crate::cds::error_text(&text(&b));
+                // A bad key or missing licence fails every job: stop them all.
+                let n = self.cds_pending.len() + self.cds_running.len() - 1;
+                self.cds_pending.clear();
+                self.cds_running.retain(|r| r.id == run);
+                self.req_done += n;
+                self.req_failed += n;
+                Err(format!(
+                    "CDS refused the request: {msg} (key from {})",
+                    crate::cds::PROFILE_PAGE
+                ))
+            }
+            Ok((s, b)) if !(200..300).contains(&s) => {
+                Err(format!("HTTP {s}: {}", crate::cds::error_text(&text(&b))))
+            }
+            Ok((_, b)) => {
+                let r = &mut self.cds_running[i];
+                match r.stage.clone() {
+                    CdsStage::Submit | CdsStage::Poll(_) => {
+                        crate::cds::parse_job(&text(&b)).and_then(|(id, st)| match st {
+                            crate::cds::JobState::Done => Ok(Some(CdsStage::Results(id))),
+                            crate::cds::JobState::Failed(m) => Err(m),
+                            crate::cds::JobState::Waiting => {
+                                r.polls += 1;
+                                // 3 s, then gradually up to 15 s between polls
+                                r.next_at = self.now + (3.0 + r.polls as f64).min(15.0);
+                                Ok(Some(CdsStage::Poll(id)))
+                            }
+                        })
+                    }
+                    CdsStage::Results(_) => {
+                        crate::cds::parse_results(&text(&b)).map(|h| Some(CdsStage::Download(h)))
+                    }
+                    CdsStage::Download(_) => crate::cds::payload_csv(&b)
+                        .and_then(|csv| crate::cds::parse_csv(&csv))
+                        .map(|series| {
+                            let job = r.job.clone();
+                            self.store.cells.entry(job.cell).or_default().extend(series);
+                            for d in job.start_day..=job.end_day {
+                                self.store.days.insert((job.cell, d));
+                            }
+                            None
+                        }),
+                }
+            }
+        };
+        match step {
+            Ok(Some(next)) => self.cds_running[i].stage = next,
+            Ok(None) | Err(_) => {
+                let r = self.cds_running.remove(i);
+                if let Err(e) = step {
+                    self.req_failed += 1;
+                    for d in r.job.start_day..=r.job.end_day {
+                        self.store.days.insert((r.job.cell, d));
+                    }
+                    self.status(format!("! CDS: {e}"));
+                }
+                self.req_done += 1;
+                self.on_download_complete();
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    fn fix_visible(&self, f: &Fix) -> bool {
+        if f.error_m.is_some_and(|e| e > self.max_error_km * 1000.0)
+            || f.speed_outlier
+            || f.argos.is_some_and(|a| a.lc < self.min_lc)
+        {
+            return false;
+        }
+        if self.hide_insignificant && !f.step_significant {
+            return false;
+        }
+        true
+    }
+
+    fn data_center(&self) -> Position {
+        let mut n = 0.0;
+        let (mut la, mut lo) = (0.0, 0.0);
+        for tr in self.tracks.iter().filter(|t| t.visible) {
+            for f in &tr.fixes {
+                la += f.lat;
+                lo += f.lon;
+                n += 1.0;
+            }
+        }
+        if n > 0.0 {
+            lon_lat(lo / n, la / n)
+        } else {
+            lon_lat(9.17, 47.67)
+        }
+    }
+
+    fn fit_to(&mut self, rect: Rect, only: Option<usize>) {
+        let (mut a, mut b, mut c, mut d) = (90.0f64, -90.0f64, 180.0f64, -180.0f64);
+        for (i, tr) in self.tracks.iter().enumerate() {
+            if !tr.visible || only.is_some_and(|o| o != i) {
+                continue;
+            }
+            for f in tr.fixes.iter().filter(|f| self.fix_visible(f)) {
+                a = a.min(f.lat);
+                b = b.max(f.lat);
+                c = c.min(f.lon);
+                d = d.max(f.lon);
+            }
+        }
+        if a > b {
+            return;
+        }
+        let merc = |lat: f64| {
+            (std::f64::consts::FRAC_PI_4 + lat.to_radians() / 2.0)
+                .tan()
+                .ln()
+                / std::f64::consts::TAU
+        };
+        let dx = ((d - c) / 360.0).max(1e-5);
+        let dy = (merc(b) - merc(a)).max(1e-5);
+        let zx = (rect.width() as f64 / (256.0 * dx)).log2();
+        let zy = (rect.height() as f64 / (256.0 * dy)).log2();
+        let z = (zx.min(zy) - 0.4).clamp(2.0, 15.0);
+        let _ = self.memory.set_zoom(z);
+        self.memory.center_at(lon_lat((c + d) / 2.0, (a + b) / 2.0));
+    }
+
+    fn wind_palette(&self) -> WindPalette {
+        self.wind_palettes
+            .get(&self.basemap)
+            .copied()
+            .unwrap_or(WindPalette::default_for(self.basemap))
+    }
+
+    /// Corners and centre of the area of interest: the downloaded ERA5 cells, or the
+    /// visible fixes when no weather is loaded.
+    fn night_probe_points(&self) -> Vec<(f64, f64)> {
+        let pts: Vec<(f64, f64)> = if self.store.is_empty() {
+            self.tracks
+                .iter()
+                .filter(|t| t.visible)
+                .flat_map(|t| t.fixes.iter().map(|f| (f.lat, f.lon)))
+                .collect()
+        } else {
+            self.store
+                .cells
+                .keys()
+                .map(|&k| weather::cell_center(k))
+                .collect()
+        };
+        let Some(&(la0, lo0)) = pts.first() else {
+            return Vec::new();
+        };
+        let (mut s, mut n, mut w, mut e) = (la0, la0, lo0, lo0);
+        for &(la, lo) in &pts {
+            s = s.min(la);
+            n = n.max(la);
+            w = w.min(lo);
+            e = e.max(lo);
+        }
+        vec![
+            (s, w),
+            (s, e),
+            (n, w),
+            (n, e),
+            ((s + n) / 2.0, (w + e) / 2.0),
+        ]
+    }
+
+    /// If it is day everywhere in the area at `t_now`, jump forward to the next night.
+    fn skip_to_night(&mut self) {
+        let probes = self.night_probe_points();
+        if probes.is_empty() {
+            return;
+        }
+        let night = |t: f64| {
+            probes
+                .iter()
+                .any(|&(la, lo)| geo::is_night(t as i64, la, lo))
+        };
+        if night(self.t_now) {
+            return;
+        }
+        // 10-min steps, at most two days ahead (polar summer has no night).
+        let limit = (self.t_now + 2.0 * 86400.0).min(self.t_max);
+        let mut t = self.t_now;
+        while t < limit && !night(t) {
+            t += 600.0;
+        }
+        if night(t) {
+            self.t_now = t;
+        }
+    }
+
+    fn step_selected(&mut self, dir: i32) {
+        let ti = self
+            .selected
+            .map(|s| s.0)
+            .or(self.selected_track)
+            .or(if self.tracks.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
+        let Some(ti) = ti else { return };
+        let tr = &self.tracks[ti];
+        if tr.fixes.is_empty() {
+            return;
+        }
+        let cur = tr.fixes.partition_point(|f| (f.t as f64) < self.t_now);
+        let idx = if dir > 0 {
+            (cur + usize::from(cur < tr.fixes.len() && tr.fixes[cur].t as f64 <= self.t_now))
+                .min(tr.fixes.len() - 1)
+        } else {
+            cur.saturating_sub(1)
+        };
+        self.t_now = tr.fixes[idx].t as f64;
+        self.selected = Some((ti, idx));
+    }
+
+    // ------------------------------------------------------------------ UI
+
+    fn top_bar(&mut self, ui: &mut Ui) {
+        let narrow = self.narrow;
+        ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(&mut self.side_open, "Panel")
+                .on_hover_text("Show or hide the side panel");
+            if !narrow {
+                ui.strong("FinTrack");
+            }
+            ui.separator();
+            ui.selectable_value(&mut self.view_tab, ViewTab::Map, "2D map");
+            ui.selectable_value(&mut self.view_tab, ViewTab::ThreeD, "3D dives");
+            ui.separator();
+            if ui
+                .add_enabled(!self.tracks.is_empty(), egui::Button::new("Share"))
+                .on_hover_text(
+                    "Link that opens exactly this view - data, time, map, 3D camera and settings",
+                )
+                .clicked()
+            {
+                self.share_dialog = true;
+            }
+            if narrow {
+                ui.menu_button("File", |ui| self.file_actions(ui));
+                ui.menu_button("Layers", |ui| self.layer_actions(ui));
+            } else {
+                self.file_actions(ui);
+                ui.separator();
+                self.layer_actions(ui);
+            }
+        });
+    }
+
+    /// Open / demo / export / clear (inline on wide screens, a "File" menu on phones).
+    fn file_actions(&mut self, ui: &mut Ui) {
+        if ui
+            .button("Open…")
+            .on_hover_text("CSV from Wildcloud, Movebank, CTT or R")
+            .clicked()
+        {
+            self.open_dialog(ui.ctx());
+        }
+        if ui
+            .button("Load demo")
+            .on_hover_text("Simulated elephant seal (Argos + deep dives) and grey seal (GPS + benthic dives) in Movebank format - not real animals")
+            .clicked()
+        {
+            self.load_demo();
+        }
+        if ui
+            .add_enabled(
+                !self.tracks.is_empty(),
+                egui::Button::new("Export annotated CSV"),
+            )
+            .clicked()
+        {
+            self.export();
+        }
+        if let Some(rec) = &self.rec {
+            let frac = rec.frames as f32 / rec.total.max(1) as f32;
+            let text = format!("REC {}/{}", rec.frames, rec.total);
+            ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(text));
+            if ui.button("Stop & save").clicked()
+                && let Some(rec) = self.rec.take()
+            {
+                let ctx = ui.ctx().clone();
+                self.finish_recording(rec, Ok(()), &ctx);
+            }
+        } else if ui
+            .add_enabled(!self.tracks.is_empty(), egui::Button::new("Export video…"))
+            .on_hover_text("MP4 or GIF of the animated map, legend and sensor chart")
+            .clicked()
+        {
+            self.open_video_dialog();
+        }
+        if ui
+            .add_enabled(!self.tracks.is_empty(), egui::Button::new("Clear"))
+            .clicked()
+        {
+            self.tracks.clear();
+            self.files.clear();
+            self.acc_files.clear();
+            self.acc_sets.clear();
+            self.selected = None;
+            self.selected_track = None;
+            self.packed_cache = None;
+        }
+        if ui
+            .button("Open URL…")
+            .on_hover_text("Load a CSV from a web address (e.g. a GitHub raw link) - shared links then reference it instead of embedding it")
+            .clicked()
+        {
+            self.url_dialog = true;
+        }
+    }
+
+    /// Basemap and daily-satellite controls (inline on wide screens, a "Layers" menu on phones).
+    fn layer_actions(&mut self, ui: &mut Ui) {
+        egui::ComboBox::from_id_salt("basemap")
+            .selected_text(self.basemap.label())
+            .show_ui(ui, |ui| {
+                for b in Basemap::ALL {
+                    ui.selectable_value(&mut self.basemap, b, b.label());
+                }
+            });
+        ui.checkbox(&mut self.sat_on, "Ocean & satellite imagery").on_hover_text(
+            "NASA GIBS imagery for the day under the cursor: sea surface temperature (GHRSST MUR), \
+             chlorophyll-a (MODIS Aqua / VIIRS), true colour, GPM IMERG precipitation or AIRS air temperature",
+        );
+        if self.sat_on {
+            egui::ComboBox::from_id_salt("sat")
+                .selected_text(self.sat_layer.label())
+                .show_ui(ui, |ui| {
+                    for l in SatLayer::ALL {
+                        ui.selectable_value(&mut self.sat_layer, l, l.label());
+                    }
+                });
+            ui.add(egui::Slider::new(&mut self.sat_opacity, 0.1..=1.0).text("opacity"));
+            if let Some((title, lo, hi)) = self.sat_layer.legend() {
+                ui.weak(format!(
+                    "{title}: {lo} → {hi} (NASA Worldview colour scale). Time step: {}",
+                    if self.sat_layer == SatLayer::ImergPrecip {
+                        "30 min"
+                    } else {
+                        "1 day"
+                    }
+                ));
+            }
+        }
+        let label = self
+            .overlay
+            .map_or("Ships & wind farms: off", |o| o.label());
+        egui::ComboBox::from_id_salt("overlay")
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.overlay, None, "off");
+                for o in crate::tiles::Overlay::ALL {
+                    ui.selectable_value(&mut self.overlay, Some(o), o.label());
+                }
+            })
+            .response
+            .on_hover_text(
+                "Static overlays (WMS): EMODnet vessel density from AIS (hours per km² per month, \
+                 European seas), EMODnet offshore wind farms, GEBCO bathymetry. Offshore turbines \
+                 worldwide: side panel → Wind turbines & offshore structures (OpenStreetMap).",
+            );
+        if self.overlay.is_some() {
+            ui.add(egui::Slider::new(&mut self.overlay_opacity, 0.1..=1.0).text("overlay"));
+        }
+    }
+
+    fn side_panel(&mut self, ui: &mut Ui) {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // ---- files & firmware
+            egui::CollapsingHeader::new(format!("Files & firmware ({})", self.files.len())).default_open(true).show(ui, |ui| {
+                if self.files.is_empty() {
+                    ui.weak("No files yet. Supported: Movebank exports with GPS and Argos locations (classes, error ellipses) plus depth / temperature rows, any lat/lon/time CSV (with optional lc, depth, temperature columns) - plus acceleration (Movebank e-obs, Technosmart, per-sample CSV).");
+                }
+                let mut reparse: Option<(usize, String)> = None;
+                for (i, f) in self.files.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&f.name).small());
+                    });
+                    let mut chosen = f.firmware.clone();
+                    egui::ComboBox::from_id_salt(("fw", i))
+                        .width(260.0)
+                        .selected_text(firmware::label_for(&chosen))
+                        .show_ui(ui, |ui| {
+                            for fw in firmware::registry() {
+                                let score = f.ranking.iter().find(|r| r.0 == fw.id()).map(|r| r.1).unwrap_or(0.0);
+                                ui.selectable_value(&mut chosen, fw.id().to_string(), format!("{}  ({:.0}%)", fw.label(), score * 100.0))
+                                    .on_hover_text(fw.description());
+                            }
+                        });
+                    if chosen != f.firmware {
+                        reparse = Some((i, chosen));
+                    }
+                }
+                if let Some((i, fw)) = reparse {
+                    let name = self.files[i].name.clone();
+                    let bytes = self.files[i].bytes.clone();
+                    self.add_file(name, bytes, Some(&fw));
+                }
+            });
+
+            // ---- tracks
+            egui::CollapsingHeader::new(format!("Tracks ({})", self.tracks.len())).default_open(true).show(ui, |ui| {
+                if !self.tracks.is_empty() {
+                    let n_vis = self.tracks.iter().filter(|t| t.visible).count();
+                    let mut all = n_vis == self.tracks.len();
+                    ui.horizontal(|ui| {
+                        let partial = n_vis > 0 && !all;
+                        if ui
+                            .add(egui::Checkbox::new(&mut all, format!("all individuals ({n_vis}/{})", self.tracks.len())).indeterminate(partial))
+                            .changed()
+                        {
+                            self.tracks.iter_mut().for_each(|t| t.visible = all);
+                        }
+                        if ui.small_button("none").clicked() {
+                            self.tracks.iter_mut().for_each(|t| t.visible = false);
+                        }
+                        if ui.small_button("invert").clicked() {
+                            self.tracks.iter_mut().for_each(|t| t.visible = !t.visible);
+                        }
+                    });
+                    let mut restore = false;
+                    ui.horizontal(|ui| {
+                        if self.tracks.iter().any(|t| t.date_filter.is_some()) {
+                            restore = ui
+                                .small_button("restore")
+                                .on_hover_text("Clear every date filter")
+                                .clicked();
+                        }
+                    });
+                    if restore {
+                        let all: Vec<usize> = (0..self.tracks.len()).collect();
+                        self.set_date_filter(&all, None);
+                        self.status("Restored all fixes (date filters cleared)".to_string());
+                    }
+                    ui.separator();
+                }
+                let mut zoom_to = None;
+                let mut date_click = None;
+                let mut date_action: Option<DateAction> = None;
+                for (i, tr) in self.tracks.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut tr.visible, "");
+                        ui.color_edit_button_srgb(&mut tr.color);
+                        let sel = self.selected_track == Some(i);
+                        if ui.add(egui::Button::new(egui::RichText::new(&tr.id).strong()).selected(sel)).clicked() {
+                            self.selected_track = if sel { None } else { Some(i) };
+                        }
+                        if ui.small_button("zoom").on_hover_text("Zoom to track").clicked() {
+                            zoom_to = Some(i);
+                        }
+                        let filtered = tr.date_filter.is_some();
+                        let btn = egui::Button::new(if filtered { "📅 filtered" } else { "📅" })
+                            .small()
+                            .selected(filtered || self.date_edit == Some(i));
+                        if ui.add(btn).on_hover_text("Keep only fixes inside a date range").clicked() {
+                            date_click = Some(i);
+                        }
+                    });
+                    let range = tr.time_range().map(|(a, b)| format!("{} to {}", fmt_date(a), fmt_date(b))).unwrap_or_default();
+                    let hidden = if tr.excluded_fixes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({} outside the date range)", tr.excluded_fixes.len())
+                    };
+                    ui.weak(format!(
+                        "   {} · {} fixes{hidden} · {}{}",
+                        tr.tag,
+                        tr.fixes.len(),
+                        range,
+                        tr.species.as_ref().map(|s| format!(" · {s}")).unwrap_or_default()
+                    ));
+                    if self.date_edit == Some(i) {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("from");
+                                ui.add(egui::TextEdit::singleline(&mut self.date_from).desired_width(130.0).hint_text("YYYY-MM-DD [HH:MM]"));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("to   ");
+                                ui.add(egui::TextEdit::singleline(&mut self.date_to).desired_width(130.0).hint_text("YYYY-MM-DD [HH:MM]"));
+                            });
+                            let range = parse_date_range(&self.date_from, &self.date_to);
+                            if let Err(e) = &range {
+                                ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e);
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(range.is_ok(), egui::Button::new("apply")).clicked() {
+                                    date_action = Some((vec![i], range.clone().ok()));
+                                }
+                                if ui
+                                    .add_enabled(range.is_ok(), egui::Button::new("apply to all visible"))
+                                    .on_hover_text("Use this range for every visible track (e.g. one season)")
+                                    .clicked()
+                                {
+                                    date_action = Some((Vec::new(), range.clone().ok()));
+                                }
+                                if ui.add_enabled(tr.date_filter.is_some(), egui::Button::new("clear")).clicked() {
+                                    date_action = Some((vec![i], None));
+                                }
+                            });
+                            ui.weak("Dates are UTC; a bare date covers the whole day. Fixes and sensor data outside the range are set aside, not deleted.");
+                        });
+                    }
+                }
+                if let Some(i) = date_click {
+                    if self.date_edit == Some(i) {
+                        self.date_edit = None;
+                    } else {
+                        let tr = &self.tracks[i];
+                        let (a, b) = tr.date_filter.or(tr.full_time_range()).unwrap_or((0, 0));
+                        self.date_from = fmt_minute(a);
+                        self.date_to = fmt_minute(b);
+                        self.date_edit = Some(i);
+                    }
+                }
+                if let Some((idxs, range)) = date_action {
+                    let idxs = if idxs.is_empty() {
+                        (0..self.tracks.len()).filter(|&j| self.tracks[j].visible).collect()
+                    } else {
+                        idxs
+                    };
+                    self.set_date_filter(&idxs, range);
+                    self.date_edit = None;
+                }
+                if let Some(i) = zoom_to {
+                    self.selected_track = Some(i);
+                    self.fit_pending = true;
+                    self.view3d.request_fit();
+                    if self.narrow {
+                        self.side_open = false; // show the map on phones
+                    }
+                }
+            });
+
+            // ---- display
+            egui::CollapsingHeader::new("Display").default_open(true).show(ui, |ui| {
+                egui::ComboBox::from_label("colour by").selected_text(self.color_by.label()).show_ui(ui, |ui| {
+                    for c in ColorBy::ALL {
+                        ui.selectable_value(&mut self.color_by, c, c.label());
+                    }
+                });
+                ui.add(egui::Slider::new(&mut self.max_error_km, 0.5..=50.0).logarithmic(true).text("max location error (km)"))
+                    .on_hover_text("Hide fixes whose error radius (Argos error / ellipse RMS, GPS accuracy) exceeds this");
+                ui.checkbox(&mut self.hide_insignificant, "hide steps smaller than location error");
+                ui.checkbox(&mut self.show_error, "location-error circles");
+                ui.checkbox(&mut self.trail_to_cursor, "draw tracks only up to cursor");
+                ui.checkbox(&mut self.follow, "follow selected animal");
+            });
+
+            // ---- wind & weather: everything wind / weather in one place
+            egui::CollapsingHeader::new("Wind & weather (ERA5)").default_open(false).show(ui, |ui| {
+                egui::CollapsingHeader::new("Download & annotate (ERA5)").default_open(true).show(ui, |ui| {
+                    self.era5_download_ui(ui);
+                });
+                egui::CollapsingHeader::new("Map layers").default_open(true).show(ui, |ui| {
+                    self.wind_map_ui(ui);
+                    ui.separator();
+                    self.wx_fields_ui(ui);
+                    ui.weak("SST, chlorophyll, precipitation imagery: 'Ocean & satellite imagery' in the top bar.");
+                });
+                egui::CollapsingHeader::new("Tropical cyclones").default_open(false).show(ui, |ui| {
+                    self.cyclones_ui(ui);
+                });
+            });
+
+            // ---- acceleration
+            egui::CollapsingHeader::new(format!("Acceleration ({})", self.acc_sets.len()))
+                .default_open(!self.acc_sets.is_empty())
+                .show(ui, |ui| {
+                    self.acc_panel(ui);
+                });
+
+            // ---- dives & ocean
+            egui::CollapsingHeader::new("Dives, bathymetry & ocean").default_open(true).show(ui, |ui| {
+                self.ocean_panel(ui);
+            });
+
+            // ---- movement analysis
+            egui::CollapsingHeader::new("Movement analysis").default_open(self.mv_ui.open).show(ui, |ui| {
+                self.movement_panel(ui);
+            });
+
+            // ---- wind turbines & structures
+            egui::CollapsingHeader::new("Wind turbines & offshore structures").default_open(false).show(ui, |ui| {
+                self.structures_panel(ui);
+            });
+
+            // ---- selected fix
+            if let Some((ti, fi)) = self.selected
+                && let Some(f) = self.tracks.get(ti).and_then(|t| t.fixes.get(fi)) {
+                    let tr = &self.tracks[ti];
+                    egui::CollapsingHeader::new(format!("Selected fix · {}", tr.id)).default_open(true).show(ui, |ui| {
+                        let classes: Vec<String> = self
+                            .acc_cache
+                            .as_ref()
+                            .map(|c| c.a.classes.clone())
+                            .unwrap_or_default();
+                        fix_details(ui, tr, f, &classes);
+                    });
+                }
+
+            egui::CollapsingHeader::new("Log").default_open(false).show(ui, |ui| {
+                for l in self.log.iter().rev().take(40) {
+                    ui.small(l);
+                }
+            });
+        });
+    }
+
+    fn time_slider(&mut self, ui: &mut Ui) {
+        let (lo, hi) = (self.t_min, self.t_max);
+        let reserve = if self.narrow { 10.0 } else { 190.0 };
+        ui.spacing_mut().slider_width = (ui.available_width() - reserve).max(100.0);
+        ui.add(
+            egui::Slider::new(&mut self.t_now, lo..=hi)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        if !self.narrow {
+            ui.monospace(fmt_time(self.t_now as i64) + " UTC");
+        }
+    }
+
+    /// Categorical legend entries for the current 'Colour by', if it is categorical.
+    fn legend_swatches(&self) -> Option<(&'static str, Vec<(String, Color32)>)> {
+        match self.color_by {
+            ColorBy::AccBehaviour => Some((
+                "ACC behaviour",
+                self.acc_cache
+                    .as_ref()
+                    .map(|c| {
+                        c.a.classes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| (n.clone(), BEHAVIOUR_COLORS[i % BEHAVIOUR_COLORS.len()]))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )),
+            ColorBy::HmmState => {
+                let k = self
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.fixes.iter())
+                    .filter_map(|f| f.mv.as_ref().and_then(|m| m.hmm_state))
+                    .max()
+                    .map(|m| m as usize + 1)?;
+                Some((
+                    "HMM state",
+                    (0..k)
+                        .map(|s| {
+                            let n = match s {
+                                0 => format!("{} slowest", s + 1),
+                                _ if s + 1 == k => format!("{} fastest", s + 1),
+                                _ => format!("{}", s + 1),
+                            };
+                            (n, movement_ui::hmm_color(s as u8))
+                        })
+                        .collect(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn timeline(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .button(if self.playing { "Pause" } else { "Play" })
+                .clicked()
+            {
+                if !self.playing && self.t_now >= self.t_max {
+                    self.t_now = self.t_min;
+                }
+                self.playing = !self.playing;
+            }
+            if ui
+                .button("< fix")
+                .on_hover_text("previous fix (left arrow)")
+                .clicked()
+            {
+                self.step_selected(-1);
+            }
+            if ui
+                .button("fix >")
+                .on_hover_text("next fix (right arrow)")
+                .clicked()
+            {
+                self.step_selected(1);
+            }
+            egui::ComboBox::from_id_salt("speed")
+                .width(80.0)
+                .selected_text(SPEEDS[self.speed_idx].1)
+                .show_ui(ui, |ui| {
+                    for (i, s) in SPEEDS.iter().enumerate() {
+                        ui.selectable_value(&mut self.speed_idx, i, s.1);
+                    }
+                });
+            ui.toggle_value(&mut self.chart_open, "Chart")
+                .on_hover_text("Show or hide the chart");
+            if self.narrow {
+                let short = chrono::DateTime::<chrono::Utc>::from_timestamp(self.t_now as i64, 0)
+                    .map(|d| d.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                ui.monospace(short);
+            } else {
+                self.time_slider(ui);
+            }
+        });
+        if self.narrow {
+            ui.horizontal(|ui| self.time_slider(ui));
+        }
+        if !self.chart_open {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("chartvar")
+                .selected_text(self.chart_var.label())
+                .show_ui(ui, |ui| {
+                    for v in ChartVar::ALL {
+                        ui.selectable_value(&mut self.chart_var, v, v.label());
+                    }
+                });
+            if self.chart_subplots.len() < 4
+                && ui
+                    .small_button("+ subplot")
+                    .on_hover_text("Stack another chart below, on the same time axis")
+                    .clicked()
+            {
+                // a useful next variable: crosswind, then cloud base, wind support, altitude
+                let next = [
+                    ChartVar::Ocean(OceanVar::DiveMax),
+                    ChartVar::Sensor(SensorKind::Temperature),
+                    ChartVar::Ocean(OceanVar::WaveHeight),
+                    ChartVar::Ocean(OceanVar::CurrentSupport),
+                ]
+                .into_iter()
+                .find(|v| *v != self.chart_var && !self.chart_subplots.contains(v))
+                .unwrap_or(ChartVar::GroundSpeed);
+                self.chart_subplots.push(next);
+            }
+            if self.chart_var == ChartVar::Curtain {
+                egui::ComboBox::from_id_salt("curtain_metric")
+                    .selected_text(self.curtain_metric.label())
+                    .show_ui(ui, |ui| {
+                        for m in CurtainMetric::ALL {
+                            ui.selectable_value(&mut self.curtain_metric, m, m.label());
+                        }
+                    });
+            }
+            if !self.narrow {
+                ui.weak(match self.selected_track {
+                    Some(i) => format!(
+                        "showing {}",
+                        self.tracks.get(i).map(|t| t.id.as_str()).unwrap_or("")
+                    ),
+                    None => "showing all visible tracks (click a track name to isolate)".into(),
+                });
+            }
+        });
+        // the data span plotted last frame: when it changes (other track, variable, filter),
+        // the charts go back to fitting all data
+        let span = self.chart_full_x_acc.take();
+        if span != self.chart_full_x {
+            if self.chart_full_x.is_some() {
+                self.chart_x_view = None;
+            }
+            self.chart_full_x = span;
+        }
+        // main chart + stacked subplots share the height; time-series plots share the x axis
+        let n = 1 + self.chart_subplots.len();
+        let row_h = if self.chart_subplots.is_empty() {
+            0.0
+        } else {
+            24.0
+        };
+        let avail = ui.available_height();
+        let h = ((avail - row_h * (n - 1) as f32) / n as f32).max(60.0);
+        let w = ui.available_width();
+        match self.chart_var {
+            ChartVar::Curtain | ChartVar::Profile | ChartVar::AccBurst => {
+                ui.allocate_ui(vec2(w, h), |ui| match self.chart_var {
+                    ChartVar::Curtain => self.curtain_chart(ui),
+                    ChartVar::Profile => self.profile_chart(ui),
+                    _ => self.acc_burst_chart(ui),
+                });
+            }
+            v => self.series_plot(ui, v, 0, h),
+        }
+        let mut remove = None;
+        for k in 0..self.chart_subplots.len() {
+            ui.horizontal(|ui| {
+                let cur = self.chart_subplots[k];
+                let mut v = cur;
+                egui::ComboBox::from_id_salt(("subplot", k))
+                    .selected_text(v.label())
+                    .show_ui(ui, |ui| {
+                        for o in ChartVar::ALL.into_iter().filter(|o| o.is_series()) {
+                            ui.selectable_value(&mut v, o, o.label());
+                        }
+                    });
+                if v != cur {
+                    self.chart_subplots[k] = v;
+                }
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Remove this subplot")
+                    .clicked()
+                {
+                    remove = Some(k);
+                }
+            });
+            let v = self.chart_subplots[k];
+            self.series_plot(ui, v, k + 1, h);
+        }
+        if let Some(k) = remove {
+            self.chart_subplots.remove(k);
+        }
+    }
+
+    /// One time-series chart (`slot` 0 = main), with the cursor line; click to move time.
+    fn series_plot(&mut self, ui: &mut Ui, var: ChartVar, slot: usize, height: f32) {
+        let mut series: Vec<(String, Color32, Vec<[f64; 2]>)> = Vec::new();
+        for (i, tr) in self.tracks.iter().enumerate() {
+            if !tr.visible || self.selected_track.is_some_and(|s| s != i) {
+                continue;
+            }
+            let tk = self.track_key(i);
+            let pts: Vec<[f64; 2]> = match var {
+                ChartVar::Acc(m) => match &self.acc_cache {
+                    Some(c) => self
+                        .acc_sets
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.track.as_deref() == Some(tk.as_str()))
+                        .flat_map(|(si, _)| c.a.per_set[si].iter())
+                        .filter_map(|r| m.of(r).map(|v| [r.f.t_ms as f64 / 86_400_000.0, v]))
+                        .collect(),
+                    None => Vec::new(),
+                },
+                ChartVar::Move(MoveMetric::Displacement) => {
+                    let mut first: Option<(f64, f64)> = None;
+                    tr.fixes
+                        .iter()
+                        .filter(|f| self.fix_visible(f))
+                        .map(|f| {
+                            let (la, lo) = *first.get_or_insert((f.lat, f.lon));
+                            [
+                                f.t as f64 / 86400.0,
+                                geo::haversine_m(la, lo, f.lat, f.lon) / 1000.0,
+                            ]
+                        })
+                        .collect()
+                }
+                ChartVar::Sensor(k) => {
+                    // depths plot downward
+                    let sign = if k == SensorKind::Depth { -1.0 } else { 1.0 };
+                    tr.sensors
+                        .iter()
+                        .filter(|s| s.kind == k)
+                        .map(|s| [s.t as f64 / 86400.0, sign * s.value as f64])
+                        .collect()
+                }
+                ChartVar::Ocean(o @ (OceanVar::DiveMax | OceanVar::DiveDuration)) => self
+                    .dive_cache
+                    .get(&tk)
+                    .map(|(_, d)| {
+                        d.iter()
+                            .map(|d| {
+                                [
+                                    d.t_max as f64 / 86400.0,
+                                    if o == OceanVar::DiveMax {
+                                        -(d.max_depth as f64)
+                                    } else {
+                                        d.duration_s() as f64 / 60.0
+                                    },
+                                ]
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => tr
+                    .fixes
+                    .iter()
+                    .filter(|f| self.fix_visible(f))
+                    .filter_map(|f| var.of_fix(f).map(|v| [f.t as f64 / 86400.0, v as f64]))
+                    .collect(),
+            };
+            if !pts.is_empty() {
+                series.push((
+                    tr.id.clone(),
+                    Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]),
+                    pts,
+                ));
+            }
+        }
+        // depth charts get the seafloor under the animal (dashed)
+        let mut dashed: Vec<(String, Color32, Vec<[f64; 2]>)> = Vec::new();
+        let other = match var {
+            ChartVar::Sensor(SensorKind::Depth) | ChartVar::Ocean(OceanVar::DiveMax) => {
+                Some(ChartVar::Ocean(OceanVar::Seafloor))
+            }
+            ChartVar::Altitude => Some(ChartVar::CloudBase),
+            ChartVar::CloudBase => Some(ChartVar::Altitude),
+            _ => None,
+        };
+        if let Some(o) = other {
+            for (i, tr) in self.tracks.iter().enumerate() {
+                if !tr.visible || self.selected_track.is_some_and(|s| s != i) {
+                    continue;
+                }
+                let pts: Vec<[f64; 2]> = tr
+                    .fixes
+                    .iter()
+                    .filter(|f| self.fix_visible(f))
+                    .filter_map(|f| o.of_fix(f).map(|v| [f.t as f64 / 86400.0, v as f64]))
+                    .collect();
+                if !pts.is_empty() {
+                    let name = match o {
+                        ChartVar::CloudBase => "cloud base",
+                        ChartVar::Ocean(OceanVar::Seafloor) => "seafloor",
+                        _ => "altitude",
+                    };
+                    dashed.push((
+                        format!("{} {name}", tr.id),
+                        Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2])
+                            .gamma_multiply(0.6),
+                        pts,
+                    ));
+                }
+            }
+        }
+        let t_now_d = self.t_now / 86400.0;
+        let zero_line = matches!(
+            var,
+            ChartVar::WindSupport
+                | ChartVar::Ocean(OceanVar::CurrentSupport)
+                | ChartVar::Sensor(SensorKind::Depth)
+                | ChartVar::Ocean(OceanVar::DiveMax)
+        );
+        // Axes: x is shared by all stacked charts (zoom / pan any of them, double-click to fit
+        // all data again); y always fits the data inside the visible time window.
+        let own_x = series
+            .iter()
+            .chain(dashed.iter())
+            .flat_map(|(_, _, p)| p.iter())
+            .fold(None, |r: Option<[f64; 2]>, q| {
+                Some(r.map_or([q[0], q[0]], |r| [r[0].min(q[0]), r[1].max(q[0])]))
+            });
+        if let Some(o) = own_x {
+            self.chart_full_x_acc = Some(union_range(self.chart_full_x_acc, o));
+        }
+        let x_range = self
+            .chart_x_view
+            .or(self.chart_full_x.or(own_x).map(pad_range));
+        let y_range = x_range.and_then(|xr| {
+            let ys = series
+                .iter()
+                .chain(dashed.iter())
+                .flat_map(|(_, _, p)| p.iter())
+                .filter(|q| q[0] >= xr[0] && q[0] <= xr[1] && q[1].is_finite())
+                .map(|q| q[1]);
+            let mut r: Option<[f64; 2]> = None;
+            for y in ys.chain(zero_line.then_some(0.0)) {
+                r = Some(r.map_or([y, y], |r| [r[0].min(y), r[1].max(y)]));
+            }
+            r.map(|r| {
+                let span = (r[1] - r[0]).max(1e-6 * r[1].abs().max(1.0));
+                if r[1] - r[0] < 1e-9 {
+                    [r[0] - 0.5 * span.max(0.5), r[1] + 0.5 * span.max(0.5)]
+                } else {
+                    [r[0] - 0.06 * span, r[1] + 0.06 * span]
+                }
+            })
+        });
+        let resp = Plot::new(("chart", slot))
+            .height(height)
+            .allow_zoom([true, false])
+            .allow_drag([true, false])
+            .allow_boxed_zoom(false)
+            .link_cursor(egui::Id::unique("timeline_x"), [true, false])
+            .legend_if(!self.narrow && slot == 0)
+            .allow_scroll(false)
+            .x_axis_formatter(|m: GridMark, _r| fmt_date((m.value * 86400.0) as i64))
+            .label_formatter(|h: &HoverPosition<'_>| {
+                Some(match h {
+                    HoverPosition::NearDataPoint {
+                        plot_name,
+                        position: p,
+                        ..
+                    } => {
+                        format!(
+                            "{plot_name}\n{}\n{:.2}",
+                            fmt_time((p.x * 86400.0) as i64),
+                            p.y
+                        )
+                    }
+                    HoverPosition::Elsewhere { position: p } => fmt_time((p.x * 86400.0) as i64),
+                })
+            })
+            .show(ui, |pui| {
+                if let Some(xr) = x_range {
+                    pui.set_plot_bounds_x(xr[0]..=xr[1]);
+                }
+                if let Some(yr) = y_range {
+                    pui.set_plot_bounds_y(yr[0]..=yr[1]);
+                }
+                for (name, c, pts) in &series {
+                    // per-burst ACC metrics are clouds of points, not lines
+                    if !matches!(var, ChartVar::Acc(_)) {
+                        pui.line(
+                            Line::new(name.clone(), PlotPoints::from(pts.clone()))
+                                .color(*c)
+                                .width(1.5),
+                        );
+                    }
+                    pui.points(
+                        Points::new(name.clone(), PlotPoints::from(pts.clone()))
+                            .color(*c)
+                            .radius(2.0),
+                    );
+                }
+                for (name, c, pts) in &dashed {
+                    pui.line(
+                        Line::new(name.clone(), PlotPoints::from(pts.clone()))
+                            .color(*c)
+                            .width(1.2)
+                            .style(egui_plot::LineStyle::dashed_loose()),
+                    );
+                }
+                if zero_line {
+                    pui.hline(egui_plot::HLine::new("0", 0.0).color(Color32::from_gray(90)));
+                }
+                pui.vline(VLine::new("now", t_now_d).color(Color32::from_rgb(255, 80, 80)));
+                if pui.response().clicked() {
+                    pui.pointer_coordinate()
+                } else {
+                    None
+                }
+            });
+        // a zoom / pan by the user (applied after our bounds) becomes the shared time window
+        let b = resp.transform.bounds();
+        if resp.response.double_clicked() {
+            self.chart_x_view = None;
+        } else if let Some(xr) = x_range {
+            let (lo, hi) = (b.min()[0], b.max()[0]);
+            let tol = 1e-7 * (xr[1] - xr[0]).abs().max(1e-9);
+            if hi > lo && ((lo - xr[0]).abs() > tol || (hi - xr[1]).abs() > tol) {
+                self.chart_x_view = Some([lo, hi]);
+                ui.ctx().request_repaint();
+            }
+        }
+        if let Some(p) = resp.inner {
+            self.t_now = (p.x * 86400.0).clamp(self.t_min, self.t_max);
+            self.playing = false;
+        }
+    }
+
+    fn map(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let rect = ui.available_rect_before_wrap();
+        if self.fit_pending {
+            self.fit_to(rect, self.selected_track);
+            self.fit_pending = false;
+        }
+        // Follow mode
+        let mut my_pos = self.data_center();
+        if self.follow
+            && let Some(ti) = self.selected.map(|s| s.0).or(self.selected_track)
+            && let Some((la, lo, _)) = self.tracks.get(ti).and_then(|t| t.position_at(self.t_now))
+        {
+            my_pos = lon_lat(lo, la);
+            self.memory.follow_my_position();
+        }
+
+        let home_ranges = self.home_range_draw();
+        let dive_markers = self.dive_markers();
+        let swatches = self.legend_swatches();
+        let basemap = self.basemap;
+        let wind_pal = self.wind_palette();
+        let base = self
+            .base_tiles
+            .entry(basemap)
+            .or_insert_with(|| HttpTiles::new(basemap, ctx.clone()));
+        let date = self.sat_layer.time_key(self.t_now as i64);
+        let sat_key = (self.sat_layer, date.clone());
+        if self.sat_on && !self.sat_tiles.contains_key(&sat_key) {
+            if self.sat_tiles.len() > 4 {
+                self.sat_tiles.clear();
+            }
+            self.sat_tiles.insert(
+                sat_key.clone(),
+                HttpTiles::new(
+                    Gibs {
+                        layer: self.sat_layer,
+                        date: date.clone(),
+                    },
+                    ctx.clone(),
+                ),
+            );
+        }
+
+        let mut interaction = Interaction::default();
+        let layer = TrackLayer {
+            tracks: &self.tracks,
+            t_now: self.t_now,
+            trail_to_cursor: self.trail_to_cursor,
+            show_error: self.show_error,
+            show_wind_arrows: self.show_wind_arrows,
+            show_wind_field: self.show_wind_field,
+            wind_field_night_only: self.wind_field_night_only,
+            wind_palette: wind_pal,
+            store: &self.store,
+            selected: self.selected,
+            app: ViewCfg {
+                max_error_m: self.max_error_km * 1000.0,
+                min_lc: self.min_lc,
+                hide_insignificant: self.hide_insignificant,
+                color_by: self.color_by,
+                acc_band: self.acc_params.band,
+            },
+            structs: self.st_cache.as_ref().filter(|_| self.st_on).map(|c| {
+                (
+                    crate::structures::Draw {
+                        items: &self.st_store.items,
+                        hits: &c.hits,
+                        params: self.st_params,
+                    },
+                    self.st_highlight.then_some(&c.near),
+                )
+            }),
+            wx: WxDraw::build(
+                &self.store,
+                self.t_now as i64,
+                self.opts.field_stride,
+                self.wx_field,
+                self.wx_isobars,
+                self.wx_centres,
+            ),
+            storms: (self.storms_on && !self.storms.is_empty()).then_some(&self.storms[..]),
+            home_ranges,
+            dives: dive_markers,
+            out: &mut interaction,
+        };
+
+        let attribution = base.attribution().text;
+        let mut map = walkers::Map::new(Some(base as &mut dyn Tiles), &mut self.memory, my_pos);
+        if self.sat_on
+            && let Some(st) = self.sat_tiles.get_mut(&sat_key)
+        {
+            map = map.with_layer(st as &mut dyn Tiles, self.sat_opacity);
+        }
+        if let Some(ov) = self.overlay {
+            let ot = self
+                .overlay_tiles
+                .entry(ov)
+                .or_insert_with(|| HttpTiles::new(crate::tiles::OverlayTiles(ov), ctx.clone()));
+            map = map.with_layer(ot as &mut dyn Tiles, self.overlay_opacity);
+        }
+        let color_by = self.color_by;
+        let wx_field = self.wx_field;
+        let wind_legend = (self.show_wind_field && !self.store.is_empty()).then_some(wind_pal);
+        let sat_on = self.sat_on;
+        let sat_label = self.sat_layer.label();
+        let t_now = self.t_now;
+        let sun_at = self
+            .selected
+            .map(|s| s.0)
+            .or(self.selected_track)
+            .and_then(|ti| self.tracks.get(ti).and_then(|t| t.position_at(t_now)));
+        let shown = map.with_plugin(layer).show(ui, |ui, _resp, proj, _mem| {
+            let centre = proj.unproject(ui.max_rect().center().to_vec2());
+            let r = ui.max_rect();
+            let p = ui.painter();
+            // attribution
+            let attr = if sat_on {
+                format!("{attribution} | NASA GIBS")
+            } else {
+                attribution.to_string()
+            };
+            let ar = p.text(
+                r.right_bottom() - vec2(6.0, 4.0),
+                Align2::RIGHT_BOTTOM,
+                &attr,
+                FontId::proportional(10.0),
+                Color32::from_gray(230),
+            );
+            p.rect_filled(ar.expand(2.0), 2.0, Color32::from_black_alpha(120));
+            p.text(
+                r.right_bottom() - vec2(6.0, 4.0),
+                Align2::RIGHT_BOTTOM,
+                &attr,
+                FontId::proportional(10.0),
+                Color32::from_gray(230),
+            );
+            // clock
+            let mut clock = format!("{} UTC", fmt_time(t_now as i64));
+            if let Some((la, lo, _)) = sun_at {
+                let e = geo::sun_elevation_deg(t_now as i64, la, lo);
+                clock.push_str(if e < -6.0 {
+                    "   night"
+                } else if e < 0.0 {
+                    "   twilight"
+                } else {
+                    "   day"
+                });
+                clock.push_str(&format!(" (sun {e:.0}°)"));
+            }
+            if sat_on {
+                clock.push_str(&format!("\nsatellite: {sat_label}"));
+            }
+            let cr = p.text(
+                r.center_top() + vec2(0.0, 10.0),
+                Align2::CENTER_TOP,
+                &clock,
+                FontId::proportional(14.0),
+                Color32::WHITE,
+            );
+            p.rect_filled(cr.expand(5.0), 4.0, Color32::from_black_alpha(150));
+            p.text(
+                r.center_top() + vec2(0.0, 10.0),
+                Align2::CENTER_TOP,
+                &clock,
+                FontId::proportional(14.0),
+                Color32::WHITE,
+            );
+            legend(p, r, color_by, wind_legend, &swatches, wx_field);
+            (centre.y(), centre.x())
+        });
+        self.map_center = Some(shown.inner);
+
+        if let Some(sel) = interaction.clicked {
+            self.selected = Some(sel);
+            self.t_now = self.tracks[sel.0].fixes[sel.1].t as f64;
+            self.playing = false;
+        }
+        if let Some((ti, fi, pos)) = interaction.hover {
+            self.fix_tooltip(ui, ti, fi, pos);
+        } else {
+            self.selected_card(ui);
+        }
+    }
+
+    /// On phones (no hover, side panel usually hidden) keep the tapped fix's summary on the map.
+    fn selected_card(&self, ui: &Ui) {
+        if !(self.narrow && !self.side_open) {
+            return;
+        }
+        if let Some((ti, fi)) = self.selected
+            && self.tracks.get(ti).is_some_and(|t| fi < t.fixes.len())
+        {
+            let r = ui.max_rect();
+            self.fix_tooltip(ui, ti, fi, r.left_bottom() + vec2(-6.0, -150.0));
+        }
+    }
+
+    fn fix_tooltip(&self, ui: &Ui, ti: usize, fi: usize, pos: Pos2) {
+        let tr = &self.tracks[ti];
+        let f = &tr.fixes[fi];
+        let mut s = format!("{} · {}\n{}", tr.id, tr.tag, fmt_time(f.t));
+        if let Some(e) = f.error_m {
+            s.push_str(&format!("\n± {:.1} km", e / 1000.0));
+        }
+        if let Some(a) = f.best_alt() {
+            s.push_str(&format!("\nalt {a:.0} m"));
+        }
+        if let Some(w) = f.weather.wind_support {
+            s.push_str(&format!("\nwind support {w:+.1} m/s"));
+        }
+        if let Some(w) = f.weather.seg_wind_support {
+            s.push_str(&format!("\nstep wind {w:+.1} m/s"));
+        }
+        if let Some(fw) = &f.weather.flight {
+            if let Some(ws) = fw.wind_support {
+                s.push_str(&format!(
+                    "\nflight-level support {ws:+.1} m/s ({:.0} hPa)",
+                    fw.matched_level_hpa
+                ));
+            }
+            if let (Some(b), Some(bs)) = (fw.best_level_hpa, fw.best_wind_support) {
+                s.push_str(&format!("\nbest level {b:.0} hPa: {bs:+.1} m/s"));
+            }
+        }
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::unique("maptip"),
+        ));
+        let galley_rect = painter.text(
+            pos + vec2(14.0, 0.0),
+            Align2::LEFT_TOP,
+            &s,
+            FontId::proportional(12.0),
+            Color32::WHITE,
+        );
+        painter.rect_filled(galley_rect.expand(5.0), 4.0, Color32::from_black_alpha(200));
+        painter.text(
+            pos + vec2(14.0, 0.0),
+            Align2::LEFT_TOP,
+            &s,
+            FontId::proportional(12.0),
+            Color32::WHITE,
+        );
+    }
+
+    fn map3d(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let dive_paths = self.dive_paths_3d();
+        let _ = self.current_slice();
+        let date = self.sat_layer.time_key(self.t_now as i64);
+        let sat_key = (self.sat_layer, date.clone());
+        if self.sat_on && !self.sat_tiles.contains_key(&sat_key) {
+            if self.sat_tiles.len() > 4 {
+                self.sat_tiles.clear();
+            }
+            self.sat_tiles.insert(
+                sat_key.clone(),
+                HttpTiles::new(
+                    Gibs {
+                        layer: self.sat_layer,
+                        date,
+                    },
+                    ctx.clone(),
+                ),
+            );
+        }
+        let basemap = self.basemap;
+        let base = self
+            .base_tiles
+            .entry(basemap)
+            .or_insert_with(|| HttpTiles::new(basemap, ctx.clone()));
+        let attribution = base.attribution().text.to_string();
+        let slice = self.slice_cache.as_ref().and_then(|c| c.1.as_ref());
+        let slice_level_hpa: Vec<f32> = slice
+            .map(|sl| sl.levels.iter().map(|&i| self.profiles.levels[i]).collect())
+            .unwrap_or_default();
+        let sat = if self.sat_on {
+            self.sat_tiles
+                .get_mut(&sat_key)
+                .map(|t| (t as &mut dyn Tiles, self.sat_opacity))
+        } else {
+            None
+        };
+        let scene = Scene {
+            tracks: &self.tracks,
+            t_now: self.t_now,
+            trail_to_cursor: self.trail_to_cursor,
+            selected: self.selected,
+            focus_track: self.selected_track,
+            slice,
+            slice_level_hpa,
+            base: Some(base as &mut dyn Tiles),
+            sat,
+            source_label: if slice.is_some() {
+                self.profiles.source.label()
+            } else {
+                String::new()
+            },
+            basemap_attribution: attribution,
+            max_error_m: self.max_error_km * 1000.0,
+            structures: self.st_cache.as_ref().filter(|_| self.st_on).map(|c| {
+                crate::structures::Draw {
+                    items: &self.st_store.items,
+                    hits: &c.hits,
+                    params: self.st_params,
+                }
+            }),
+            dives: dive_paths,
+            clouds: self
+                .view3d
+                .show_clouds
+                .then(|| {
+                    let t = self.t_now as i64;
+                    let st = self.opts.field_stride;
+                    let base = crate::wxfield::grid(&self.store, t, st, weather::cloud_base_m)?;
+                    let low = crate::wxfield::grid(&self.store, t, st, |v| {
+                        Some(v[weather::CLOUD_LOW]).filter(|x| x.is_finite())
+                    })?;
+                    Some((base, low))
+                })
+                .flatten(),
+        };
+        let out = self.view3d.show(ui, scene);
+        if let Some(sel) = out.clicked {
+            self.selected = Some(sel);
+            self.t_now = self.tracks[sel.0].fixes[sel.1].t as f64;
+            self.playing = false;
+        }
+        if let Some((ti, fi, pos)) = out.hover {
+            self.fix_tooltip(ui, ti, fi, pos);
+        } else {
+            self.selected_card(ui);
+        }
+    }
+
+    fn curtain_chart(&mut self, ui: &mut Ui) {
+        let Some(ti) = self.chart_track() else {
+            ui.weak("No visible track.");
+            return;
+        };
+        if self.profiles.is_empty() {
+            ui.weak("No pressure-level wind yet - use \"Download along tracks\" or \"Import ERA5 cube…\" in the side panel.");
+            return;
+        }
+        let key = (
+            ti,
+            self.profiles.generation,
+            self.curtain_metric,
+            self.tracks[ti].fixes.len(),
+        );
+        if self.curtain_cache.as_ref().is_none_or(|c| c.0 != key) {
+            let c = wind3d::curtain(&self.profiles, &self.tracks[ti], self.curtain_metric, 300);
+            self.curtain_cache = Some((key, c));
+        }
+        let Some(c) = self.curtain_cache.as_ref().and_then(|c| c.1.as_ref()) else {
+            ui.weak("No wind data along this track yet.");
+            return;
+        };
+        let tr = &self.tracks[ti];
+        let metric = self.curtain_metric;
+        let nl = self.profiles.levels.len();
+        let dx = c.step_s as f64 / 86400.0;
+        let mut cells: Vec<([[f64; 2]; 4], Color32)> = Vec::new();
+        for (i, &t) in c.times.iter().enumerate() {
+            let x0 = t as f64 / 86400.0 - dx / 2.0;
+            let x1 = x0 + dx;
+            for j in 0..nl {
+                let (v, z) = (c.val[i][j], c.z[i][j]);
+                if !v.is_finite() || !z.is_finite() {
+                    continue;
+                }
+                let zp = if j > 0 { c.z[i][j - 1] } else { f32::NAN };
+                let zn = if j + 1 < nl { c.z[i][j + 1] } else { f32::NAN };
+                let mut lo = if zp.is_finite() {
+                    (zp + z) / 2.0
+                } else if zn.is_finite() {
+                    z - (zn - z) / 2.0
+                } else {
+                    z - 100.0
+                };
+                if c.ground_z[i].is_finite() {
+                    lo = lo.max(c.ground_z[i]);
+                }
+                let hi = if zn.is_finite() {
+                    (z + zn) / 2.0
+                } else if zp.is_finite() {
+                    z + (z - zp) / 2.0
+                } else {
+                    z + 100.0
+                };
+                let col = match metric {
+                    CurtainMetric::WindSpeed => crate::view3d::wind_color(v, 255),
+                    _ => diverging(v / 10.0),
+                };
+                cells.push((
+                    [
+                        [x0, lo as f64],
+                        [x1, lo as f64],
+                        [x1, hi as f64],
+                        [x0, hi as f64],
+                    ],
+                    col,
+                ));
+            }
+        }
+        let alt: Vec<[f64; 2]> = tr
+            .fixes
+            .iter()
+            .filter_map(|f| {
+                let h = f
+                    .weather
+                    .flight
+                    .as_ref()
+                    .and_then(|w| w.flight_height_m)
+                    .or(f.best_alt())?;
+                Some([f.t as f64 / 86400.0, h as f64])
+            })
+            .collect();
+        let best: Vec<[f64; 2]> = c
+            .times
+            .iter()
+            .zip(&c.best_z)
+            .filter(|(_, z)| z.is_finite())
+            .map(|(t, z)| [*t as f64 / 86400.0, *z as f64])
+            .collect();
+        let ground: Vec<[f64; 2]> = c
+            .times
+            .iter()
+            .zip(&c.ground_z)
+            .filter(|(_, z)| z.is_finite())
+            .map(|(t, z)| [*t as f64 / 86400.0, *z as f64])
+            .collect();
+        let tcol = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
+        let id = tr.id.clone();
+        if !self.narrow {
+            ui.weak(format!(
+            "{} along {id}'s path (colour: {}) · line = animal altitude · dashed = level with best wind support",
+            metric.label(),
+            if metric == CurtainMetric::WindSpeed { "speed 0–28 m/s" } else { "blue tailwind / red headwind, ±10 m/s" }
+        ));
+        }
+        let t_now_d = self.t_now / 86400.0;
+        let resp = Plot::new("curtain")
+            .legend_if(!self.narrow)
+            .allow_scroll(false)
+            .y_axis_label("height (m ASL)")
+            .x_axis_formatter(|m: GridMark, _r| fmt_date((m.value * 86400.0) as i64))
+            .label_formatter(|h: &HoverPosition<'_>| {
+                let p = match h {
+                    HoverPosition::NearDataPoint { position, .. } => position,
+                    HoverPosition::Elsewhere { position } => position,
+                };
+                Some(format!(
+                    "{}\n{:.0} m",
+                    fmt_time((p.x * 86400.0) as i64),
+                    p.y
+                ))
+            })
+            .show(ui, |pui| {
+                for (k, (pts, col)) in cells.iter().enumerate() {
+                    pui.polygon(
+                        egui_plot::Polygon::new("", PlotPoints::from(pts.to_vec()))
+                            .fill_color(*col)
+                            .stroke(Stroke::NONE)
+                            .allow_hover(false)
+                            .id(("cell", k)),
+                    );
+                }
+                if !ground.is_empty() {
+                    pui.line(
+                        Line::new("ground", PlotPoints::from(ground))
+                            .color(Color32::from_gray(60))
+                            .width(2.0),
+                    );
+                }
+                if !best.is_empty() {
+                    pui.line(
+                        Line::new("best level", PlotPoints::from(best))
+                            .color(Color32::from_rgb(255, 230, 120))
+                            .style(egui_plot::LineStyle::dashed_loose())
+                            .width(1.2),
+                    );
+                }
+                if !alt.is_empty() {
+                    pui.line(
+                        Line::new(format!("{id} altitude"), PlotPoints::from(alt.clone()))
+                            .color(Color32::WHITE)
+                            .width(2.0),
+                    );
+                    pui.points(
+                        Points::new(format!("{id} altitude"), PlotPoints::from(alt))
+                            .color(tcol)
+                            .radius(3.0),
+                    );
+                }
+                pui.vline(VLine::new("now", t_now_d).color(Color32::from_rgb(255, 80, 80)));
+                if pui.response().clicked() {
+                    pui.pointer_coordinate()
+                } else {
+                    None
+                }
+            });
+        if let Some(p) = resp.inner {
+            self.t_now = (p.x * 86400.0).clamp(self.t_min, self.t_max);
+            self.playing = false;
+        }
+    }
+
+    fn profile_chart(&mut self, ui: &mut Ui) {
+        if self.profiles.is_empty() {
+            ui.weak("No pressure-level wind yet - use \"Download along tracks\" or \"Import ERA5 cube…\" in the side panel.");
+            return;
+        }
+        // Selected fix, else the chart track's position at the cursor.
+        let target = if let Some((ti, fi)) = self.selected
+            && let Some(f) = self.tracks.get(ti).and_then(|t| t.fixes.get(fi))
+        {
+            let h = f
+                .weather
+                .flight
+                .as_ref()
+                .and_then(|w| w.flight_height_m)
+                .or(f.best_alt());
+            Some((
+                ti,
+                f.lat,
+                f.lon,
+                f.t,
+                f.reported_heading.or(f.bearing_deg),
+                h,
+            ))
+        } else if let Some(ti) = self.chart_track()
+            && let Some((la, lo, idx)) = self.tracks[ti].position_at(self.t_now)
+        {
+            let tr = &self.tracks[ti];
+            let hd = tr.fixes.get(idx + 1).map(|b| {
+                geo::bearing_deg(tr.fixes[idx].lat, tr.fixes[idx].lon, b.lat, b.lon) as f32
+            });
+            Some((ti, la, lo, self.t_now as i64, hd, None))
+        } else {
+            None
+        };
+        let Some((ti, la, lo, t, hd, h_animal)) = target else {
+            ui.weak("Select a fix or move the cursor into a track's time range.");
+            return;
+        };
+        let Some(prof) = self.profiles.sample(la, lo, t) else {
+            ui.weak(format!(
+                "No wind profile at {} for this location yet.",
+                fmt_time(t)
+            ));
+            return;
+        };
+        let st = &self.profiles;
+        let (mut sup, mut crs, mut spd) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..st.levels.len() {
+            if !st.above_ground(&prof, i) || !prof.lv[i].z.is_finite() {
+                continue;
+            }
+            let l = prof.lv[i];
+            let z = l.z as f64;
+            spd.push([l.speed() as f64, z]);
+            if let Some(h) = hd {
+                let (s, c) = geo::wind_components(l.u as f64, l.v as f64, h as f64);
+                sup.push([s, z]);
+                crs.push([c, z]);
+            }
+        }
+        let ground = if prof.sp.is_finite() {
+            st.height_of_pressure(&prof, prof.sp)
+        } else {
+            None
+        };
+        let tr = &self.tracks[ti];
+        let tcol = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
+        ui.weak(format!(
+            "Wind profile · {} · {} · {:.3}, {:.3}{}",
+            tr.id,
+            fmt_time(t),
+            la,
+            lo,
+            hd.map(|h| format!(" · heading {h:.0}°"))
+                .unwrap_or_else(|| " · no heading (support not defined)".into())
+        ));
+        Plot::new("profile")
+            .legend_if(!self.narrow)
+            .allow_scroll(false)
+            .x_axis_label("m/s")
+            .y_axis_label("height (m ASL)")
+            .show(ui, |pui| {
+                pui.vline(VLine::new("", 0.0).color(Color32::from_gray(90)));
+                pui.line(
+                    Line::new("wind speed", PlotPoints::from(spd.clone()))
+                        .color(Color32::from_gray(190))
+                        .width(1.5),
+                );
+                pui.points(
+                    Points::new("wind speed", PlotPoints::from(spd))
+                        .color(Color32::from_gray(190))
+                        .radius(3.0),
+                );
+                if !sup.is_empty() {
+                    pui.line(
+                        Line::new("wind support", PlotPoints::from(sup.clone()))
+                            .color(Color32::from_rgb(80, 160, 230))
+                            .width(2.0),
+                    );
+                    pui.points(
+                        Points::new("wind support", PlotPoints::from(sup))
+                            .color(Color32::from_rgb(80, 160, 230))
+                            .radius(3.0),
+                    );
+                    pui.line(
+                        Line::new("crosswind", PlotPoints::from(crs.clone()))
+                            .color(Color32::from_rgb(230, 150, 60))
+                            .width(1.5),
+                    );
+                    pui.points(
+                        Points::new("crosswind", PlotPoints::from(crs))
+                            .color(Color32::from_rgb(230, 150, 60))
+                            .radius(2.5),
+                    );
+                }
+                if let Some(h) = h_animal {
+                    pui.hline(
+                        egui_plot::HLine::new("animal altitude", h as f64)
+                            .color(tcol)
+                            .width(2.0),
+                    );
+                }
+                if let Some(g) = ground {
+                    pui.hline(
+                        egui_plot::HLine::new("ground", g as f64)
+                            .color(Color32::from_gray(70))
+                            .width(2.0),
+                    );
+                }
+            });
+    }
+}
+
+fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix, classes: &[String]) {
+    let w = &f.weather;
+    let row = |ui: &mut Ui, k: &str, v: String| {
+        ui.label(k);
+        ui.monospace(v);
+        ui.end_row();
+    };
+    let o = |v: Option<f32>, unit: &str, d: usize| {
+        v.map(|x| format!("{x:.d$} {unit}"))
+            .unwrap_or_else(|| "-".into())
+    };
+    egui::Grid::new("fixgrid")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            row(ui, "time (UTC)", fmt_time(f.t));
+            row(ui, "position", format!("{:.5}, {:.5}", f.lat, f.lon));
+            row(ui, "source", f.source.label().into());
+            if let Some(a) = f.argos {
+                row(ui, "Argos class", a.lc.label().into());
+                if let (Some(ma), Some(mi)) = (a.semi_major_m, a.semi_minor_m) {
+                    row(
+                        ui,
+                        "error ellipse",
+                        format!(
+                            "{:.1} × {:.1} km, {:.0}°",
+                            ma / 1000.0,
+                            mi / 1000.0,
+                            a.orientation_deg.unwrap_or(0.0)
+                        ),
+                    );
+                }
+            }
+            row(
+                ui,
+                "error radius",
+                o(f.error_m.map(|e| e / 1000.0), "km", 2),
+            );
+            if f.speed_outlier {
+                row(ui, "speed filter", "removed".into());
+            }
+            row(ui, "depth", o(f.depth_m, "m", 1));
+            row(
+                ui,
+                "seafloor",
+                o(
+                    w.seafloor_m.filter(|v| v.is_finite()).map(|v| -v),
+                    "m deep",
+                    0,
+                ),
+            );
+            if let Some(m) = &w.marine {
+                row(ui, "SST", o(m.sst_c, "°C", 1));
+                row(
+                    ui,
+                    "waves",
+                    match (m.wave_height_m, m.wave_period_s, m.wave_from_deg) {
+                        (Some(h), Some(p), Some(d)) => format!("{h:.1} m, {p:.0} s, from {d:.0}°"),
+                        (Some(h), _, _) => format!("{h:.1} m"),
+                        _ => "-".into(),
+                    },
+                );
+                row(ui, "swell", o(m.swell_height_m, "m", 1));
+                row(
+                    ui,
+                    "current",
+                    match (m.current_ms, m.current_to_deg) {
+                        (Some(s), Some(d)) => format!("{s:.2} m/s towards {d:.0}°"),
+                        _ => "-".into(),
+                    },
+                );
+                row(ui, "current along heading", o(m.current_support, "m/s", 2));
+                row(ui, "sea level (tide)", o(m.sea_level_m, "m", 2));
+            }
+            if f.alt_m.is_some() {
+                row(
+                    ui,
+                    "GPS height",
+                    match (f.alt_m, f.alt_source) {
+                        (Some(a), Some(s)) => format!("{a:.0} m ({})", s.label()),
+                        _ => "-".into(),
+                    },
+                );
+            }
+            row(ui, "step", o(f.step_m.map(|s| s / 1000.0), "km", 1));
+            row(ui, "time since prev", o(f.dt_s.map(|s| s / 3600.0), "h", 1));
+            row(ui, "ground speed", o(f.ground_speed_ms, "m/s", 1));
+            row(ui, "heading", o(f.bearing_deg, "°", 0));
+            row(
+                ui,
+                "real movement",
+                if f.step_significant {
+                    "yes".into()
+                } else {
+                    "no (< error)".into()
+                },
+            );
+            row(ui, "tag / water temp", o(f.temp_c, "°C", 1));
+            row(ui, "activity", o(f.activity, "", 0));
+            row(ui, "wind level", w.level.unwrap_or("-").into());
+            row(
+                ui,
+                "wind",
+                match (w.wind_speed, w.wind_from_deg) {
+                    (Some(s), Some(d)) => format!("{s:.1} m/s from {d:.0}°"),
+                    _ => "-".into(),
+                },
+            );
+            row(ui, "wind support", o(w.wind_support, "m/s", 1));
+            row(
+                ui,
+                "wind at 2 m",
+                o(
+                    w.wind_speed
+                        .filter(|_| w.level != Some("100m"))
+                        .map(crate::marine::wind_2m_from_10m),
+                    "m/s",
+                    1,
+                ),
+            );
+            row(ui, "ERA5 T2m", o(w.temp_2m, "°C", 1));
+            row(ui, "ERA5 MSLP", o(w.msl_hpa, "hPa", 1));
+            row(ui, "precipitation", o(w.precipitation_mm, "mm", 1));
+            row(ui, "cloud cover", o(w.cloud_cover, "%", 0));
+            if let Some(a) = &f.acc {
+                row(ui, "ACC bursts (step)", a.n.to_string());
+                row(
+                    ui,
+                    "ACC flight share",
+                    format!("{:.0} %", a.flight_frac * 100.0),
+                );
+                row(
+                    ui,
+                    "ACC dynamic SD / VeDBA",
+                    format!("{:.2} / {:.2} g", a.dyn_sd, a.vedba),
+                );
+                row(ui, "ACC wingbeat", o(a.wbf_hz, "Hz", 1));
+                row(ui, "ACC pitch", format!("{:.0}°", a.pitch_deg));
+                if let Some(c) = a.cluster {
+                    let fr: Vec<String> = a
+                        .cluster_frac
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, x)| **x > 0.0)
+                        .map(|(i, x)| format!("C{} {:.0}%", i + 1, x * 100.0))
+                        .collect();
+                    row(ui, "ACC cluster", format!("C{} ({})", c + 1, fr.join(", ")));
+                }
+                if let Some(b) = a.behaviour {
+                    let fr: Vec<String> = a
+                        .behaviour_frac
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, x)| **x > 0.0)
+                        .map(|(i, x)| {
+                            format!(
+                                "{} {:.0}%",
+                                classes.get(i).map(String::as_str).unwrap_or("?"),
+                                x * 100.0
+                            )
+                        })
+                        .collect();
+                    row(
+                        ui,
+                        "ACC behaviour",
+                        format!(
+                            "{} ({})",
+                            classes.get(b).map(String::as_str).unwrap_or("?"),
+                            fr.join(", ")
+                        ),
+                    );
+                }
+            }
+            if let Some(fw) = &w.flight {
+                row(
+                    ui,
+                    "flight pressure",
+                    format!("{:.1} hPa", fw.flight_pressure_hpa),
+                );
+                row(ui, "flight height (profile)", o(fw.flight_height_m, "m", 0));
+                row(
+                    ui,
+                    "matched level",
+                    format!("{:.0} hPa", fw.matched_level_hpa),
+                );
+                row(ui, "flight-level wind", format!("{:.1} m/s", fw.wind_speed));
+                row(ui, "flight-level support", o(fw.wind_support, "m/s", 1));
+                row(ui, "flight-level crosswind", o(fw.crosswind, "m/s", 1));
+                row(ui, "flight-level airspeed", o(fw.airspeed, "m/s", 1));
+                row(
+                    ui,
+                    "best level",
+                    match (fw.best_level_hpa, fw.best_wind_support) {
+                        (Some(l), Some(b)) => format!("{l:.0} hPa ({b:+.1} m/s)"),
+                        _ => "-".into(),
+                    },
+                );
+                row(
+                    ui,
+                    "at best level",
+                    fw.at_best_wind
+                        .map(|b| if b { "yes" } else { "no" })
+                        .unwrap_or("-")
+                        .into(),
+                );
+                row(ui, "3D wind source", fw.source.clone());
+            }
+            for (k, v) in &f.extra {
+                row(ui, k, v.clone());
+            }
+        });
+    ui.weak(format!(
+        "firmware profile: {} · file: {}",
+        firmware::label_for(&tr.firmware),
+        tr.file
+    ));
+}
+
+impl eframe::App for FinApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.now = ctx.input(|i| i.time);
+        self.sync_url_hash();
+        self.process_messages(ctx);
+        match self.view_tab {
+            ViewTab::ThreeD => {
+                self.maybe_request_field();
+                if self.view3d.show_clouds {
+                    self.maybe_request_surface_field();
+                }
+            }
+            ViewTab::Map => self.maybe_request_surface_field(),
+        }
+        self.pump_weather(ctx);
+        self.pump_cds(ctx);
+        if self.storms_fetch_pending && !self.tracks.is_empty() && self.downloads_idle() {
+            self.storms_fetch_pending = false;
+            self.fetch_cyclones(ctx);
+        }
+        self.plan_structures();
+        self.pump_structures(ctx);
+        self.pump_marine(ctx);
+        self.pump_bathy(ctx);
+        self.ensure_dives();
+        self.ensure_st_cache();
+        self.ensure_acc_cache();
+        self.record_tick(ctx);
+        if self.playing {
+            let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
+            self.t_now += dt * SPEEDS[self.speed_idx].0;
+            if self.skip_daytime {
+                self.skip_to_night();
+            }
+            if self.t_now >= self.t_max {
+                self.t_now = self.t_max;
+                self.playing = false;
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.handle_drops(&ctx);
+        let typing = ctx.egui_wants_keyboard_input();
+        if !typing {
+            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                self.playing = !self.playing;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                self.step_selected(1);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                self.step_selected(-1);
+            }
+        }
+        let screen = ctx.content_rect();
+        self.narrow = screen.width() < 760.0;
+        if !self.layout_init {
+            // Phones start with the side panel hidden and a shorter chart.
+            self.side_open = !self.narrow;
+            self.layout_init = true;
+        }
+        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
+        let side_w = if self.narrow {
+            (screen.width() * 0.85).min(330.0)
+        } else {
+            330.0
+        };
+        let mut side_open = self.side_open;
+        egui::Panel::left(if self.narrow { "side_narrow" } else { "side" })
+            .resizable(true)
+            .default_size(side_w)
+            .size_range(180.0..=screen.width().max(200.0) * 0.95)
+            .show_collapsible(ui, &mut side_open, |ui| self.side_panel(ui));
+        self.side_open = side_open;
+        let chart_h = if self.narrow {
+            (screen.height() * 0.3).clamp(140.0, 220.0)
+        } else {
+            250.0
+        };
+        let bottom = if self.chart_open {
+            egui::Panel::bottom(if self.narrow {
+                "timeline_narrow"
+            } else {
+                "timeline"
+            })
+            .resizable(true)
+            .default_size(chart_h)
+        } else {
+            egui::Panel::bottom("timeline_min").resizable(false)
+        };
+        self.timeline_rect = bottom.show(ui, |ui| self.timeline(ui)).response.rect;
+        self.map_rect = egui::CentralPanel::no_frame()
+            .show(ui, |ui| match self.view_tab {
+                ViewTab::Map => self.map(ui),
+                ViewTab::ThreeD => self.map3d(ui),
+            })
+            .response
+            .rect;
+        self.video_window(&ctx);
+        self.share_window(&ctx);
+        self.url_window(&ctx);
+    }
+}
+
+/// Address of this page without the fragment (web), or the published web app (desktop).
+fn page_base_url() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(loc) = web_sys::window().map(|w| w.location())
+            && let (Ok(o), Ok(p)) = (loc.origin(), loc.pathname())
+        {
+            return format!("{o}{p}");
+        }
+    }
+    share::WEB_APP_URL.to_string()
+}
+
+/// The share link the app was opened with: the page's `#…` on the web, or a link passed
+/// as the first command-line argument on the desktop.
+fn startup_link() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let h = web_sys::window()?.location().hash().ok()?;
+        (h.len() > 2).then_some(h)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::args().nth(1).filter(|a| a.contains('#'))
+    }
+}
+
+/// Charts drop their legend on phone-width screens, where it would cover the plot.
+trait PlotLegendExt {
+    fn legend_if(self, on: bool) -> Self;
+}
+
+impl PlotLegendExt for Plot<'_> {
+    fn legend_if(self, on: bool) -> Self {
+        if on {
+            self.legend(Legend::default())
+        } else {
+            self
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Map drawing plugin
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Interaction {
+    hover: Option<(usize, usize, Pos2)>,
+    clicked: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct ViewCfg {
+    max_error_m: f32,
+    min_lc: ArgosLc,
+    hide_insignificant: bool,
+    color_by: ColorBy,
+    /// Wingbeat band, for the wingbeat colour scale.
+    acc_band: (f32, f32),
+}
+
+struct TrackLayer<'a> {
+    tracks: &'a [Track],
+    t_now: f64,
+    trail_to_cursor: bool,
+    show_error: bool,
+    show_wind_arrows: bool,
+    show_wind_field: bool,
+    wind_field_night_only: bool,
+    wind_palette: WindPalette,
+    store: &'a WeatherStore,
+    selected: Option<(usize, usize)>,
+    app: ViewCfg,
+    /// Wind turbines & structures, plus steps to highlight.
+    structs: Option<StructLayer<'a>>,
+    /// ERA5 colour field, isobars and pressure centres at the cursor hour.
+    wx: Option<WxDraw>,
+    storms: Option<&'a [crate::cyclones::Storm]>,
+    /// Dive markers: (lat, lon, max depth m, duration min, deep).
+    dives: Vec<(f64, f64, f32, f32, bool)>,
+    /// Home-range contours: (colour, width, dashed, (lat, lon) segments).
+    home_ranges: Vec<movement_ui::HrLine>,
+    out: &'a mut Interaction,
+}
+
+/// One isobar level and its segments (lat, lon).
+type Isobar = (f32, Vec<[(f64, f64); 2]>);
+
+/// Weather layers prepared for one frame.
+struct WxDraw {
+    var: crate::wxfield::FieldVar,
+    field: Option<crate::wxfield::Grid>,
+    isobars: Vec<Isobar>,
+    centres: Vec<crate::wxfield::Centre>,
+}
+
+impl WxDraw {
+    fn build(
+        store: &WeatherStore,
+        t: i64,
+        step: i32,
+        var: crate::wxfield::FieldVar,
+        isobars: bool,
+        centres: bool,
+    ) -> Option<WxDraw> {
+        use crate::wxfield::{self as wx, FieldVar};
+        if var == FieldVar::Off && !isobars && !centres {
+            return None;
+        }
+        let field = (var != FieldVar::Off)
+            .then(|| wx::grid(store, t, step, |v| var.value(v)))
+            .flatten();
+        let p = (isobars || centres)
+            .then(|| wx::grid(store, t, step, |v| FieldVar::Pressure.value(v)))
+            .flatten();
+        let iso = match (&p, isobars) {
+            (Some(p), true) => wx::levels(p, 4.0)
+                .into_iter()
+                .map(|l| (l, wx::contour(p, l)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let cen = match (&p, centres) {
+            (Some(p), true) => {
+                let w = wx::grid(store, t, step, |v| FieldVar::Wind.value(v));
+                wx::centres(p, w.as_ref())
+            }
+            _ => Vec::new(),
+        };
+        Some(WxDraw {
+            var,
+            field,
+            isobars: iso,
+            centres: cen,
+        })
+    }
+}
+
+impl ViewCfg {
+    fn visible(&self, f: &Fix) -> bool {
+        !(f.error_m.is_some_and(|e| e > self.max_error_m)
+            || f.speed_outlier
+            || f.argos.is_some_and(|a| a.lc < self.min_lc)
+            || self.hide_insignificant && !f.step_significant)
+    }
+    fn color(&self, tr: &Track, f: &Fix) -> Color32 {
+        let base = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
+        let none = Color32::from_gray(140);
+        match self.color_by {
+            ColorBy::Individual => base,
+            ColorBy::WindSupport => f
+                .weather
+                .wind_support
+                .map(|v| diverging(v / 10.0))
+                .unwrap_or(none),
+            ColorBy::SegmentWind => f
+                .weather
+                .seg_wind_support
+                .map(|v| diverging(v / 10.0))
+                .unwrap_or(none),
+            ColorBy::GroundSpeed => f
+                .ground_speed_ms
+                .filter(|_| f.step_significant)
+                .map(|s| viridis(s / 15.0))
+                .unwrap_or(none),
+            ColorBy::Time => {
+                let (a, b) = tr.time_range().unwrap_or((0, 1));
+                viridis(((f.t - a) as f32) / ((b - a).max(1) as f32))
+            }
+            ColorBy::AccFlight => f
+                .acc
+                .as_ref()
+                .map(|a| viridis(a.flight_frac))
+                .unwrap_or(none),
+            ColorBy::AccWbf => f
+                .acc
+                .as_ref()
+                .and_then(|a| a.wbf_hz)
+                .map(|w| {
+                    let (lo, hi) = self.acc_band;
+                    viridis((w - lo) / (hi - lo).max(0.1))
+                })
+                .unwrap_or(none),
+            ColorBy::AccCluster => f
+                .acc
+                .as_ref()
+                .and_then(|a| a.cluster)
+                .map(|c| CLUSTER_COLORS[c % CLUSTER_COLORS.len()])
+                .unwrap_or(none),
+            ColorBy::AccBehaviour => f
+                .acc
+                .as_ref()
+                .and_then(|a| a.behaviour)
+                .map(|c| BEHAVIOUR_COLORS[c % BEHAVIOUR_COLORS.len()])
+                .unwrap_or(none),
+            ColorBy::HmmState => {
+                f.mv.as_ref()
+                    .and_then(|m| m.hmm_state)
+                    .map(movement_ui::hmm_color)
+                    .unwrap_or(none)
+            }
+            ColorBy::Segment => {
+                f.mv.as_ref()
+                    .and_then(|m| m.segment)
+                    .map(movement_ui::segment_color)
+                    .unwrap_or(none)
+            }
+            ColorBy::Fpt => {
+                f.mv.as_ref()
+                    .and_then(|m| m.fpt_h)
+                    .map(|h| viridis(fpt_norm(h)))
+                    .unwrap_or(none)
+            }
+            ColorBy::Seafloor => f
+                .weather
+                .seafloor_m
+                .filter(|v| v.is_finite())
+                .map(|v| depth_color(-v))
+                .unwrap_or(none),
+            ColorBy::FixDepth => f.depth_m.map(depth_color).unwrap_or(none),
+            ColorBy::Sst => f
+                .weather
+                .marine
+                .and_then(|m| m.sst_c)
+                .map(|v| turbo((v + 2.0) / 34.0))
+                .unwrap_or(none),
+            ColorBy::CurrentSupport => f
+                .weather
+                .marine
+                .and_then(|m| m.current_support)
+                .map(|v| diverging(v / 1.0))
+                .unwrap_or(none),
+            ColorBy::WaveHeight => f
+                .weather
+                .marine
+                .and_then(|m| m.wave_height_m)
+                .map(|v| viridis(v / 8.0))
+                .unwrap_or(none),
+            ColorBy::ArgosClass => match f.argos {
+                Some(a) => lc_color(a.lc),
+                None if f.source == crate::model::LocationSource::Gps => lc_color(ArgosLc::G),
+                None => none,
+            },
+        }
+    }
+}
+
+impl Plugin for TrackLayer<'_> {
+    fn run(
+        self: Box<Self>,
+        ui: &mut Ui,
+        response: &egui::Response,
+        projector: &Projector,
+        _memory: &MapMemory,
+    ) {
+        let painter = ui.painter().clone();
+        let clip = response.rect;
+        let to_screen =
+            |lat: f64, lon: f64| -> Pos2 { projector.project(lon_lat(lon, lat)).to_pos2() };
+        let hover_pos = response.hover_pos();
+        let mut best: Option<(f32, usize, usize, Pos2)> = None;
+
+        // ERA5 weather layers: colour field, isobars, lows / highs.
+        if let Some(wx) = &self.wx {
+            if let Some(g) = &wx.field {
+                let mut mesh = egui::Mesh::default();
+                let mut idx = vec![u32::MAX; g.ni * g.nj];
+                for a in 0..g.ni {
+                    for b in 0..g.nj {
+                        let v = g.at(a, b);
+                        if !v.is_finite() {
+                            continue;
+                        }
+                        let (la, lo) = g.latlon(a as f64, b as f64);
+                        idx[a * g.nj + b] = mesh.vertices.len() as u32;
+                        mesh.colored_vertex(to_screen(la, lo), wx.var.color(wx.var.norm(v), v));
+                    }
+                }
+                for a in 0..g.ni.saturating_sub(1) {
+                    for b in 0..g.nj.saturating_sub(1) {
+                        let q = [
+                            idx[a * g.nj + b],
+                            idx[a * g.nj + b + 1],
+                            idx[(a + 1) * g.nj + b],
+                            idx[(a + 1) * g.nj + b + 1],
+                        ];
+                        if q.iter().all(|&i| i != u32::MAX) {
+                            mesh.add_triangle(q[0], q[1], q[3]);
+                            mesh.add_triangle(q[0], q[3], q[2]);
+                        }
+                    }
+                }
+                painter.add(egui::Shape::mesh(mesh));
+            }
+            for (level, segs) in &wx.isobars {
+                let major = (*level as i32) % 20 == 0;
+                let stroke = Stroke::new(
+                    if major { 1.6 } else { 1.0 },
+                    Color32::from_rgba_unmultiplied(250, 250, 250, 190),
+                );
+                for s in segs {
+                    painter.line_segment(
+                        [to_screen(s[0].0, s[0].1), to_screen(s[1].0, s[1].1)],
+                        stroke,
+                    );
+                }
+                if let Some(s) = segs
+                    .iter()
+                    .map(|s| to_screen(s[0].0, s[0].1))
+                    .find(|p| clip.shrink(30.0).contains(*p))
+                {
+                    let txt = format!("{level:.0}");
+                    let r = painter.text(
+                        s,
+                        Align2::CENTER_CENTER,
+                        &txt,
+                        FontId::proportional(10.0),
+                        Color32::WHITE,
+                    );
+                    painter.rect_filled(r.expand(1.5), 2.0, Color32::from_black_alpha(140));
+                    painter.text(
+                        s,
+                        Align2::CENTER_CENTER,
+                        &txt,
+                        FontId::proportional(10.0),
+                        Color32::WHITE,
+                    );
+                }
+            }
+            for c in &wx.centres {
+                let p = to_screen(c.lat, c.lon);
+                if !clip.contains(p) {
+                    continue;
+                }
+                let col = if c.low {
+                    Color32::from_rgb(235, 60, 60)
+                } else {
+                    Color32::from_rgb(60, 130, 235)
+                };
+                if c.storm {
+                    painter.circle_stroke(
+                        p,
+                        16.0,
+                        Stroke::new(2.5, Color32::from_rgb(255, 70, 70)),
+                    );
+                }
+                let big = painter.text(
+                    p,
+                    Align2::CENTER_CENTER,
+                    if c.low { "L" } else { "H" },
+                    FontId::proportional(22.0),
+                    col,
+                );
+                let sub = format!(
+                    "{:.0} hPa{}{}",
+                    c.hpa,
+                    c.max_wind
+                        .filter(|_| c.low)
+                        .map(|w| format!(" · {w:.0} m/s"))
+                        .unwrap_or_default(),
+                    if c.storm { " · storm" } else { "" }
+                );
+                painter.text(
+                    big.center_bottom() + vec2(0.0, 2.0),
+                    Align2::CENTER_TOP,
+                    sub,
+                    FontId::proportional(11.0),
+                    Color32::WHITE,
+                );
+            }
+        }
+
+        // Tropical cyclones: best tracks coloured by category, position at the cursor.
+        // dives at their (interpolated) positions, deep ones on top
+        let mut dv: Vec<&(f64, f64, f32, f32, bool)> = self.dives.iter().collect();
+        dv.sort_by(|a, b| a.2.total_cmp(&b.2));
+        for &(la, lo, z, dur, deep) in dv {
+            let p = to_screen(la, lo);
+            if !clip.contains(p) {
+                continue;
+            }
+            let r = (1.5 + dur.max(0.0).sqrt() * 0.7).min(6.0);
+            let [cr, cg, cb] = crate::dives::depth_rgb(z);
+            let col = Color32::from_rgb(cr, cg, cb);
+            if deep {
+                painter.circle(
+                    p,
+                    r + 0.8,
+                    col,
+                    Stroke::new(1.0, Color32::from_black_alpha(200)),
+                );
+            } else {
+                painter.circle_filled(p, r * 0.7, col.gamma_multiply(0.75));
+            }
+        }
+        for (c, w, dashed, segs) in &self.home_ranges {
+            let stroke = Stroke::new(*w, *c);
+            let halo = Stroke::new(*w + 2.0, Color32::from_black_alpha(120));
+            for sg in segs {
+                let a = to_screen(sg[0].0, sg[0].1);
+                let b = to_screen(sg[1].0, sg[1].1);
+                if !clip.intersects(Rect::from_two_pos(a, b)) {
+                    continue;
+                }
+                if *dashed {
+                    painter.add(egui::Shape::dashed_line(&[a, b], stroke, 8.0, 5.0));
+                } else {
+                    painter.line_segment([a, b], halo);
+                    painter.line_segment([a, b], stroke);
+                }
+            }
+        }
+        if let Some(storms) = self.storms {
+            let t = self.t_now as i64;
+            for st in storms {
+                for w in st.pts.windows(2) {
+                    let (_, col) = crate::cyclones::category(w[0].sshs, w[0].wind_kt, &w[0].nature);
+                    painter.line_segment(
+                        [to_screen(w[0].lat, w[0].lon), to_screen(w[1].lat, w[1].lon)],
+                        Stroke::new(2.0, col.gamma_multiply(0.7)),
+                    );
+                }
+                for p in st.pts.iter().filter(|p| p.t % (6 * 3600) == 0) {
+                    let (_, col) = crate::cyclones::category(p.sshs, p.wind_kt, &p.nature);
+                    painter.circle_filled(to_screen(p.lat, p.lon), 2.2, col);
+                }
+                if let Some(p) = st.at(t) {
+                    let (cat, col) = crate::cyclones::category(p.sshs, p.wind_kt, &p.nature);
+                    let sp = to_screen(p.lat, p.lon);
+                    painter.circle(sp, 9.0, col, Stroke::new(2.0, Color32::BLACK));
+                    for k in 0..2 {
+                        let a = std::f32::consts::PI * k as f32;
+                        let arm: Vec<Pos2> = (0..8)
+                            .map(|i| {
+                                let r = 9.0 + i as f32 * 1.6;
+                                let th = a + i as f32 * 0.35;
+                                sp + vec2(th.cos(), th.sin()) * r
+                            })
+                            .collect();
+                        painter.add(egui::Shape::line(arm, Stroke::new(2.0, col)));
+                    }
+                    let txt = format!(
+                        "{} · {cat}{}",
+                        st.label(),
+                        p.wind_kt
+                            .map(|w| format!(" · {w:.0} kt"))
+                            .unwrap_or_default()
+                    );
+                    let r = painter.text(
+                        sp + vec2(16.0, -12.0),
+                        Align2::LEFT_BOTTOM,
+                        &txt,
+                        FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                    painter.rect_filled(r.expand(2.0), 3.0, Color32::from_black_alpha(150));
+                    painter.text(
+                        sp + vec2(16.0, -12.0),
+                        Align2::LEFT_BOTTOM,
+                        &txt,
+                        FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                } else if let Some(p0) = st.pts.first() {
+                    painter.text(
+                        to_screen(p0.lat, p0.lon) + vec2(4.0, -4.0),
+                        Align2::LEFT_BOTTOM,
+                        st.label(),
+                        FontId::proportional(10.0),
+                        Color32::from_gray(200),
+                    );
+                }
+            }
+        }
+
+        // ERA5 wind field at the cursor time.
+        if self.show_wind_field && !self.store.is_empty() {
+            let t = self.t_now as i64;
+            let ppm = projector.scale_pixel_per_meter(projector.unproject(clip.center().to_vec2()));
+            let cell_px = (weather::GRID * 111_000.0) as f32 * ppm;
+            let stride = ((22.0 / cell_px.max(0.1)).ceil() as i32).max(1);
+            // One arrow per stride×stride block of cells: the cell with data closest to the
+            // block's corner, so the pattern is stable while panning and works for cells on
+            // any download spacing (fix cells at 0.25°, wind-field grid at 0.5° / 1°).
+            let mut blocks: HashMap<(i32, i32), (i32, Pos2, f32, f32)> = HashMap::new();
+            for &k in self.store.cells.keys() {
+                let (la, lo) = weather::cell_center(k);
+                let p = to_screen(la, lo);
+                if !clip.expand(20.0).contains(p) {
+                    continue;
+                }
+                if self.wind_field_night_only && !geo::is_night(t, la, lo) {
+                    continue;
+                }
+                let Some(v) = self.store.sample_cell(k, t) else {
+                    continue;
+                };
+                let (ws, wd) = (v[2], v[3]);
+                if ws.is_nan() || wd.is_nan() {
+                    continue;
+                }
+                let score = k.0.rem_euclid(stride) + k.1.rem_euclid(stride);
+                let b = (k.0.div_euclid(stride), k.1.div_euclid(stride));
+                if blocks.get(&b).is_none_or(|e| score < e.0) {
+                    blocks.insert(b, (score, p, ws, wd));
+                }
+            }
+            let pal = self.wind_palette;
+            for (_, p, ws, wd) in blocks.into_values() {
+                let (u, vv) = geo::wind_uv(ws as f64, wd as f64);
+                let len = (ws * 2.2).clamp(4.0, 34.0);
+                let dir = vec2(u as f32, -(vv as f32)).normalized() * len;
+                if let Some(h) = pal.halo() {
+                    painter.arrow(p - dir * 0.5, dir, Stroke::new(3.8, h));
+                }
+                let c = pal.color(ws / 20.0).gamma_multiply(0.9);
+                painter.arrow(p - dir * 0.5, dir, Stroke::new(1.6, c));
+            }
+        }
+
+        // Wind turbines & tall structures, and the steps that passed close to turbines.
+        if let Some((sd, near)) = &self.structs {
+            if let Some(near) = near {
+                let halo = Color32::from_rgba_unmultiplied(255, 120, 20, 110);
+                for &(ti, fi) in near.iter() {
+                    let Some(tr) = self.tracks.get(ti).filter(|t| t.visible) else {
+                        continue;
+                    };
+                    if fi == 0 || fi >= tr.fixes.len() {
+                        continue;
+                    }
+                    let (a, b) = (&tr.fixes[fi - 1], &tr.fixes[fi]);
+                    painter.line_segment(
+                        [to_screen(a.lat, a.lon), to_screen(b.lat, b.lon)],
+                        Stroke::new(8.0, halo),
+                    );
+                }
+            }
+            let ppm = projector.scale_pixel_per_meter(projector.unproject(clip.center().to_vec2()));
+            let mut hovered: Option<(f32, usize, Pos2)> = None;
+            for (i, s) in sd.items.iter().enumerate() {
+                if !sd.params.counts(s) {
+                    continue;
+                }
+                let p = to_screen(s.lat, s.lon);
+                if !clip.expand(10.0).contains(p) {
+                    continue;
+                }
+                let hit = sd.hits.contains(&i);
+                let fill = if hit {
+                    Color32::from_rgb(255, 140, 30)
+                } else {
+                    Color32::from_gray(235)
+                };
+                let (_, rotor, _, _) = s.dims();
+                if s.kind == crate::structures::Kind::WindTurbine {
+                    let r = (rotor / 2.0 * ppm).clamp(2.0, 12.0);
+                    if r < 4.0 {
+                        painter.circle(
+                            p,
+                            2.2,
+                            fill,
+                            Stroke::new(0.6, Color32::from_black_alpha(200)),
+                        );
+                    } else {
+                        // three blades
+                        for k in 0..3 {
+                            let a = std::f32::consts::TAU * k as f32 / 3.0
+                                - std::f32::consts::FRAC_PI_2;
+                            painter.line_segment(
+                                [p, p + vec2(a.cos(), a.sin()) * r],
+                                Stroke::new(1.8, Color32::from_black_alpha(170)),
+                            );
+                            painter.line_segment(
+                                [p, p + vec2(a.cos(), a.sin()) * r],
+                                Stroke::new(1.0, fill),
+                            );
+                        }
+                        painter.circle_filled(p, 1.8, fill);
+                    }
+                } else {
+                    let r = 3.2;
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![p + vec2(0.0, -r * 1.3), p + vec2(r, r), p + vec2(-r, r)],
+                        if hit { fill } else { Color32::from_gray(170) },
+                        Stroke::new(0.6, Color32::from_black_alpha(200)),
+                    ));
+                }
+                if let Some(h) = hover_pos {
+                    let d = h.distance(p);
+                    if d < 7.0 && hovered.is_none_or(|x| d < x.0) {
+                        hovered = Some((d, i, p));
+                    }
+                }
+            }
+            if let Some((_, i, p)) = hovered {
+                let s = &sd.items[i];
+                let (hub, rotor, total, est) = s.dims();
+                let dims = if s.kind == crate::structures::Kind::WindTurbine {
+                    format!("hub {hub:.0} m · rotor {rotor:.0} m · tip {total:.0} m")
+                } else {
+                    format!("{total:.0} m")
+                };
+                let txt = format!(
+                    "{}{} - {dims}{}\n{} {}",
+                    s.kind.label(),
+                    s.name.as_ref().map(|n| format!(" {n}")).unwrap_or_default(),
+                    if est { " (estimated)" } else { "" },
+                    s.source,
+                    s.id
+                );
+                let r = painter.text(
+                    p + vec2(10.0, 10.0),
+                    Align2::LEFT_TOP,
+                    &txt,
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                );
+                painter.rect_filled(r.expand(3.0), 3.0, Color32::from_black_alpha(170));
+                painter.text(
+                    p + vec2(10.0, 10.0),
+                    Align2::LEFT_TOP,
+                    &txt,
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                );
+            }
+        }
+
+        for (ti, tr) in self.tracks.iter().enumerate() {
+            if !tr.visible || tr.fixes.is_empty() {
+                continue;
+            }
+            let base = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
+            let idx: Vec<usize> = (0..tr.fixes.len())
+                .filter(|&i| self.app.visible(&tr.fixes[i]))
+                .filter(|&i| !self.trail_to_cursor || tr.fixes[i].t as f64 <= self.t_now)
+                .collect();
+            // future part (faint) when drawing only to cursor
+            if self.trail_to_cursor {
+                let fut: Vec<Pos2> = tr
+                    .fixes
+                    .iter()
+                    .filter(|f| self.app.visible(f) && f.t as f64 > self.t_now)
+                    .map(|f| to_screen(f.lat, f.lon))
+                    .collect();
+                if fut.len() > 1 {
+                    painter.add(egui::Shape::line(
+                        fut,
+                        Stroke::new(1.0, base.gamma_multiply(0.25)),
+                    ));
+                }
+            }
+            let mut prev: Option<Pos2> = None;
+            for &i in &idx {
+                let f = &tr.fixes[i];
+                let p = to_screen(f.lat, f.lon);
+                let c = self.app.color(tr, f);
+                if let Some(q) = prev {
+                    let dashed = !f.step_significant;
+                    let st = Stroke::new(
+                        if dashed { 1.2 } else { 2.4 },
+                        if dashed { c.gamma_multiply(0.5) } else { c },
+                    );
+                    painter.line_segment([q, p], st);
+                }
+                prev = Some(p);
+            }
+            for &i in &idx {
+                let f = &tr.fixes[i];
+                let p = to_screen(f.lat, f.lon);
+                if !clip.expand(50.0).contains(p) {
+                    continue;
+                }
+                let c = self.app.color(tr, f);
+                // Argos error: the Kalman-filter ellipse when delivered, else a circle
+                if self.show_error
+                    && f.source != LocationSource::Gps
+                    && let Some(e) = f.error_m
+                {
+                    let k = projector.scale_pixel_per_meter(lon_lat(f.lon, f.lat));
+                    let ell = f.argos.and_then(|a| {
+                        Some((
+                            a.semi_major_m?,
+                            a.semi_minor_m?,
+                            a.orientation_deg.unwrap_or(0.0),
+                        ))
+                    });
+                    match ell {
+                        Some((a, b, o)) if a * k > 3.0 && a * k < 3000.0 => {
+                            let (sn, cs) = o.to_radians().sin_cos();
+                            let pts: Vec<Pos2> = (0..36)
+                                .map(|j| {
+                                    let th = j as f32 / 36.0 * std::f32::consts::TAU;
+                                    // major axis along the orientation (clockwise from north)
+                                    let (x, y) = (a * th.cos(), b * th.sin());
+                                    let east = x * sn + y * cs;
+                                    let north = x * cs - y * sn;
+                                    p + vec2(east * k, -north * k)
+                                })
+                                .collect();
+                            painter.add(egui::Shape::convex_polygon(
+                                pts,
+                                base.gamma_multiply(0.06),
+                                Stroke::new(0.7, base.gamma_multiply(0.35)),
+                            ));
+                        }
+                        _ => {
+                            let r = e * k;
+                            if r > 3.0 && r < 2000.0 {
+                                painter.circle(
+                                    p,
+                                    r,
+                                    base.gamma_multiply(0.06),
+                                    Stroke::new(0.7, base.gamma_multiply(0.35)),
+                                );
+                            }
+                        }
+                    }
+                }
+                if self.show_wind_arrows
+                    && let (Some(u), Some(v)) = (f.weather.u, f.weather.v)
+                {
+                    let s = (u * u + v * v).sqrt();
+                    let len = (s * 2.5).clamp(5.0, 40.0);
+                    let dir = vec2(u, -v).normalized() * len;
+                    let col = f
+                        .weather
+                        .seg_wind_support
+                        .or(f.weather.wind_support)
+                        .map(|w| diverging(w / 10.0))
+                        .unwrap_or(Color32::from_gray(200));
+                    painter.arrow(p, dir, Stroke::new(1.8, col));
+                }
+                let sel = self.selected == Some((ti, i));
+                painter.circle_filled(p, if sel { 6.0 } else { 3.2 }, c);
+                if sel {
+                    painter.circle_stroke(p, 9.0, Stroke::new(2.0, Color32::WHITE));
+                }
+                if let Some(h) = hover_pos {
+                    let d = h.distance(p);
+                    if d < 9.0 && best.is_none_or(|b| d < b.0) {
+                        best = Some((d, ti, i, p));
+                    }
+                }
+            }
+            // current position marker
+            if let Some((la, lo, _)) = tr.position_at(self.t_now) {
+                let p = to_screen(la, lo);
+                painter.circle(p, 7.5, base, Stroke::new(2.0, Color32::BLACK));
+                let label_rect = painter.text(
+                    p + vec2(10.0, -10.0),
+                    Align2::LEFT_BOTTOM,
+                    &tr.id,
+                    FontId::proportional(13.0),
+                    Color32::WHITE,
+                );
+                painter.rect_filled(label_rect.expand(2.0), 3.0, Color32::from_black_alpha(140));
+                painter.text(
+                    p + vec2(10.0, -10.0),
+                    Align2::LEFT_BOTTOM,
+                    &tr.id,
+                    FontId::proportional(13.0),
+                    Color32::WHITE,
+                );
+            }
+        }
+
+        if let Some((_, ti, fi, p)) = best {
+            self.out.hover = Some((ti, fi, p));
+            if response.clicked() {
+                self.out.clicked = Some((ti, fi));
+            }
+        }
+    }
+}
+
+/// Track colour legend, plus the wind-field speed scale stacked above it when shown.
+fn legend(
+    p: &egui::Painter,
+    r: Rect,
+    by: ColorBy,
+    wind: Option<WindPalette>,
+    swatches: &Option<(&str, Vec<(String, Color32)>)>,
+    field: crate::wxfield::FieldVar,
+) {
+    let mut origin = pos2(r.left() + 12.0, r.bottom() - 40.0);
+    if field != crate::wxfield::FieldVar::Off {
+        let (title, lo, hi) = field.legend();
+        colorbar(p, origin, title, lo, hi, &|x| {
+            let [r, g, b, _] = field.color(x, 1.0).to_srgba_unmultiplied();
+            Color32::from_rgb(r, g, b)
+        });
+        origin.y -= 60.0;
+    }
+    if let Some((title, classes)) = swatches {
+        // one swatch per class
+        let n = classes.len().max(1);
+        let h = 16.0 * n as f32 + 18.0;
+        let top = origin + vec2(0.0, 30.0 - h);
+        p.rect_filled(
+            Rect::from_min_size(top - vec2(6.0, 4.0), vec2(170.0, h + 4.0)),
+            4.0,
+            Color32::from_black_alpha(160),
+        );
+        p.text(
+            top,
+            Align2::LEFT_TOP,
+            *title,
+            FontId::proportional(11.0),
+            Color32::WHITE,
+        );
+        for (i, (c, col)) in classes.iter().enumerate() {
+            let y = top.y + 16.0 + 16.0 * i as f32;
+            p.rect_filled(
+                Rect::from_min_size(pos2(top.x, y + 2.0), vec2(12.0, 10.0)),
+                2.0,
+                *col,
+            );
+            p.text(
+                pos2(top.x + 18.0, y),
+                Align2::LEFT_TOP,
+                c,
+                FontId::proportional(11.0),
+                Color32::WHITE,
+            );
+        }
+        origin.y -= h + 8.0;
+    } else if track_legend(p, origin, by) {
+        origin.y -= 60.0;
+    }
+    if let Some(pal) = wind {
+        colorbar(p, origin, "ERA5 wind speed (m/s)", "0", "20+", &|x| {
+            pal.color(x)
+        });
+    }
+}
+
+fn track_legend(p: &egui::Painter, origin: Pos2, by: ColorBy) -> bool {
+    let (title, lo, hi, div): (&str, &str, &str, bool) = match by {
+        ColorBy::Individual => return false,
+        ColorBy::WindSupport => ("wind along heading (m/s)", "-10 head", "+10 tail", true),
+        ColorBy::SegmentWind => (
+            "along-step wind support (m/s)",
+            "-10 head",
+            "+10 tail",
+            true,
+        ),
+        ColorBy::GroundSpeed => ("ground speed (m/s)", "0", "15", false),
+        ColorBy::Time => ("time within track", "start", "end", false),
+        ColorBy::AccFlight => ("ACC active share of the step", "0 %", "100 %", false),
+        ColorBy::AccWbf => ("ACC stroke frequency", "band low", "band high", false),
+        ColorBy::AccBehaviour => return false,
+        ColorBy::HmmState | ColorBy::Segment | ColorBy::ArgosClass => return false,
+        ColorBy::Seafloor => ("seafloor depth (m, log)", "0", "6000", false),
+        ColorBy::FixDepth => ("depth at the fix (m, log)", "0", "6000", false),
+        ColorBy::Sst => ("sea surface temperature (°C)", "−2", "32", false),
+        ColorBy::CurrentSupport => ("current along heading (m/s)", "−1 against", "+1 with", true),
+        ColorBy::WaveHeight => ("significant wave height (m)", "0", "8", false),
+        ColorBy::Fpt => ("first-passage time (h, log)", "0.1", "1000", false),
+        ColorBy::AccCluster => {
+            colorbar(
+                p,
+                origin,
+                "ACC behaviour cluster",
+                "C1 calm",
+                "dynamic",
+                &|x| CLUSTER_COLORS[((x * 5.999) as usize).min(5)],
+            );
+            return true;
+        }
+    };
+    let f = |x: f32| {
+        if div {
+            diverging(x * 2.0 - 1.0)
+        } else if matches!(by, ColorBy::Seafloor | ColorBy::FixDepth) {
+            depth_color(10f32.powf(x * 3.778) - 1.0)
+        } else if by == ColorBy::Sst {
+            turbo(x)
+        } else {
+            viridis(x)
+        }
+    };
+    colorbar(p, origin, title, lo, hi, &f);
+    true
+}
+
+fn colorbar(
+    p: &egui::Painter,
+    origin: Pos2,
+    title: &str,
+    lo: &str,
+    hi: &str,
+    color: &dyn Fn(f32) -> Color32,
+) {
+    let w = 180.0;
+    p.rect_filled(
+        Rect::from_min_size(origin - vec2(6.0, 20.0), vec2(w + 12.0, 52.0)),
+        4.0,
+        Color32::from_black_alpha(160),
+    );
+    p.text(
+        origin - vec2(0.0, 6.0),
+        Align2::LEFT_BOTTOM,
+        title,
+        FontId::proportional(11.0),
+        Color32::WHITE,
+    );
+    let n = 40;
+    for i in 0..n {
+        let x = i as f32 / (n - 1) as f32;
+        let c = color(x);
+        let rr = Rect::from_min_size(
+            origin + vec2(x * (w - w / n as f32), 0.0),
+            vec2(w / n as f32 + 1.0, 10.0),
+        );
+        p.rect_filled(rr, 0.0, c);
+    }
+    p.text(
+        origin + vec2(0.0, 13.0),
+        Align2::LEFT_TOP,
+        lo,
+        FontId::proportional(10.0),
+        Color32::WHITE,
+    );
+    p.text(
+        origin + vec2(w, 13.0),
+        Align2::RIGHT_TOP,
+        hi,
+        FontId::proportional(10.0),
+        Color32::WHITE,
+    );
+}
+
+/// Viridis-like sequential scale, x in 0..1.
+pub fn viridis(x: f32) -> Color32 {
+    const S: [[f32; 3]; 5] = [
+        [68.0, 1.0, 84.0],
+        [59.0, 82.0, 139.0],
+        [33.0, 145.0, 140.0],
+        [94.0, 201.0, 98.0],
+        [253.0, 231.0, 37.0],
+    ];
+    lerp_stops(&S, x)
+}
+
+/// Diverging scale for wind support, x in −1 (headwind, red-orange) .. +1 (tailwind, blue).
+pub fn diverging(x: f32) -> Color32 {
+    const S: [[f32; 3]; 5] = [
+        [202.0, 0.0, 32.0],
+        [244.0, 165.0, 130.0],
+        [240.0, 240.0, 240.0],
+        [146.0, 197.0, 222.0],
+        [5.0, 113.0, 176.0],
+    ];
+    lerp_stops(&S, (x + 1.0) / 2.0)
+}
+
+fn lerp_stops(s: &[[f32; 3]], x: f32) -> Color32 {
+    let x = if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
+    let f = x * (s.len() - 1) as f32;
+    let i = (f.floor() as usize).min(s.len() - 2);
+    let w = f - i as f32;
+    let c = |k: usize| (s[i][k] + (s[i + 1][k] - s[i][k]) * w) as u8;
+    Color32::from_rgb(c(0), c(1), c(2))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_download(name: &str, bytes: &[u8], mime: &str) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    let win = web_sys::window().ok_or("no window")?;
+    let doc = win.document().ok_or("no document")?;
+    let parts = js_sys::Array::new();
+    parts.push(&js_sys::Uint8Array::from(bytes));
+    let opts = web_sys::BlobPropertyBag::new();
+    opts.set_type(mime);
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts)
+        .map_err(|e| format!("{e:?}"))?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(|e| format!("{e:?}"))?;
+    let a: web_sys::HtmlAnchorElement = doc
+        .create_element("a")
+        .map_err(|e| format!("{e:?}"))?
+        .dyn_into()
+        .map_err(|_| "anchor")?;
+    a.set_href(&url);
+    a.set_download(name);
+    a.click();
+    let _ = web_sys::Url::revoke_object_url(&url);
+    Ok(())
+}
+
+/// Cell `c` of a table row ("" if missing).
+fn t_get(r: &[String], c: usize) -> &str {
+    r.get(c).map(String::as_str).unwrap_or("")
+}
+
+/// Tracks to (re)filter (empty = all visible) and the range, `None` to clear.
+type DateAction = (Vec<usize>, Option<(i64, i64)>);
+
+/// `YYYY-MM-DD HH:MM` (UTC), the format the date-range editor shows.
+fn fmt_minute(t: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// Parse the date-range editor. A bare date means the start (from) or end (to) of that day;
+/// anything [`crate::table::parse_time`] understands is accepted too. The "to" bound is
+/// inclusive to the end of its minute.
+fn parse_date_range(from: &str, to: &str) -> Result<(i64, i64), String> {
+    fn bound(s: &str, end: bool) -> Option<i64> {
+        let s = s.trim();
+        for f in ["%Y-%m-%d", "%d.%m.%Y"] {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(s, f) {
+                let (h, m, sec) = if end { (23, 59, 59) } else { (0, 0, 0) };
+                return d.and_hms_opt(h, m, sec).map(|dt| dt.and_utc().timestamp());
+            }
+        }
+        let t = crate::table::parse_time(s)?;
+        // "HH:MM" without seconds: include the whole minute at the end bound
+        Some(if end && t % 60 == 0 { t + 59 } else { t })
+    }
+    let a = bound(from, false).ok_or("can't read the 'from' date")?;
+    let b = bound(to, true).ok_or("can't read the 'to' date")?;
+    if b < a {
+        return Err("'to' is before 'from'".into());
+    }
+    Ok((a, b))
+}
+
+/// Union of an optional range with another.
+fn union_range(a: Option<[f64; 2]>, b: [f64; 2]) -> [f64; 2] {
+    a.map_or(b, |a| [a[0].min(b[0]), a[1].max(b[1])])
+}
+
+/// 2 % margin either side (at least an hour, in days) so the end points aren't on the frame.
+fn pad_range(r: [f64; 2]) -> [f64; 2] {
+    let m = ((r[1] - r[0]) * 0.02).max(1.0 / 24.0);
+    [r[0] - m, r[1] + m]
+}
+
+/// First-passage time (h) → 0..1 on a log scale from 0.1 h to 1000 h.
+fn fpt_norm(h: f32) -> f32 {
+    ((h.max(0.1).log10() + 1.0) / 4.0).clamp(0.0, 1.0)
+}
+
+/// Depth (m, positive down) → colour (see [`crate::dives::depth_rgb`]).
+fn depth_color(d: f32) -> Color32 {
+    let [r, g, b] = crate::dives::depth_rgb(d);
+    Color32::from_rgb(r, g, b)
+}
+
+/// Turbo-like rainbow for temperatures, `x` in 0..1.
+fn turbo(x: f32) -> Color32 {
+    lerp_stops(
+        &[
+            [48.0, 18.0, 59.0],
+            [70.0, 130.0, 248.0],
+            [27.0, 229.0, 181.0],
+            [164.0, 252.0, 59.0],
+            [251.0, 185.0, 56.0],
+            [226.0, 66.0, 9.0],
+            [122.0, 4.0, 3.0],
+        ],
+        x,
+    )
+}
+
+/// Argos location class colours: green (GPS / 3) to red (B / Z).
+fn lc_color(lc: ArgosLc) -> Color32 {
+    match lc {
+        ArgosLc::G => Color32::from_rgb(120, 220, 255),
+        ArgosLc::Lc3 => Color32::from_rgb(0, 200, 120),
+        ArgosLc::Lc2 => Color32::from_rgb(120, 220, 60),
+        ArgosLc::Lc1 => Color32::from_rgb(230, 220, 40),
+        ArgosLc::Lc0 => Color32::from_rgb(250, 160, 30),
+        ArgosLc::A => Color32::from_rgb(240, 100, 40),
+        ArgosLc::B => Color32::from_rgb(220, 40, 60),
+        ArgosLc::Z => Color32::from_rgb(140, 40, 140),
+    }
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::*;
+
+    /// Synthetic Movebank e-obs ACC for a track: a burst every 10 min, flapping at 9 Hz in
+    /// the first half of the deployment, at rest afterwards.
+    fn eobs_for(tr: &Track) -> String {
+        let (t0, t1) = tr.time_range().unwrap();
+        let mut out = String::from(
+            "event-id,timestamp,eobs:accelerations-raw,eobs:acceleration-axes,eobs:acceleration-sampling-frequency-per-axis,individual-local-identifier,tag-local-identifier\n",
+        );
+        let mid = (t0 + t1) / 2;
+        let mut t = t0;
+        let mut id = 0;
+        while t <= t1 {
+            let fly = t < mid;
+            let raw: Vec<String> = (0..40)
+                .map(|i| {
+                    let ph = std::f64::consts::TAU * 9.0 * i as f64 / 33.0;
+                    let z = 2048.0 + 512.0 + if fly { 700.0 * ph.sin() } else { 0.0 };
+                    format!("2048 {} {}", 2048 + (i % 3), z.round())
+                })
+                .collect();
+            out.push_str(&format!(
+                "{id},{}.000,{},XYZ,33,{},5001\n",
+                fmt_time(t),
+                raw.join(" "),
+                tr.id
+            ));
+            t += 600;
+            id += 1;
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn acc_real_files() {
+        // WT_ACC=a.csv:b.csv cargo test acc_real_files -- --ignored --nocapture
+        let Ok(list) = std::env::var("WT_ACC") else {
+            return;
+        };
+        let mut a = FinApp::blank();
+        for p in list.split(':') {
+            let name = p.rsplit('/').next().unwrap().to_string();
+            let t0 = std::time::Instant::now();
+            a.add_file_from(
+                name,
+                std::fs::read(p).unwrap(),
+                None,
+                Some(FileOrigin::Local),
+            );
+            println!("read {p} in {:?}", t0.elapsed());
+        }
+        for l in &a.log {
+            println!("log: {l}");
+        }
+        let t0 = std::time::Instant::now();
+        a.ensure_acc_cache();
+        println!("analysis {:?}", t0.elapsed());
+        for s in &a.acc_sets {
+            let labels = s.bursts.iter().filter(|b| b.label.is_some()).count();
+            println!(
+                "set {} file {} bursts {} labelled {} track {:?} notes {:?}",
+                s.id,
+                s.file,
+                s.bursts.len(),
+                labels,
+                s.track,
+                s.notes
+            );
+        }
+        let c = a.acc_cache.as_ref().unwrap();
+        println!("classes {:?}", c.a.classes);
+        if let Some(r) = &c.a.classifier {
+            println!(
+                "kNN k={} n={} acc={:.3} bal={:.3} confusion={:?}",
+                r.k, r.n_train, r.accuracy, r.balanced_accuracy, r.confusion
+            );
+        }
+        for (i, ci) in c.a.clusters.iter().enumerate() {
+            println!(
+                "C{} n={} dyn={:.2} wbf={:?} pitch={:.0} flight={:.2} labels={:?}",
+                i + 1,
+                ci.n,
+                ci.dyn_sd,
+                ci.wbf_hz,
+                ci.pitch_deg,
+                ci.flight_frac,
+                ci.label_frac
+            );
+        }
+        for (si, v) in c.a.per_set.iter().enumerate() {
+            let mut by: std::collections::BTreeMap<String, (usize, f32, Vec<f32>)> =
+                Default::default();
+            for r in v {
+                let l = r
+                    .label
+                    .map(|l| c.a.classes[l].clone())
+                    .unwrap_or("-".into());
+                let e = by.entry(l).or_default();
+                e.0 += 1;
+                e.1 += r.f.dyn_sd;
+                if let Some(w) = r.f.wbf_hz.filter(|_| r.flight && r.f.peak_frac > 0.2) {
+                    e.2.push(w);
+                }
+            }
+            for (l, (n, d, mut w)) in by {
+                w.sort_by(|a, b| a.total_cmp(b));
+                println!(
+                    "  set{si} {l:10} n={n:5} mean dynSD={:.3} g  median wbf(flight)={:?} (n={})",
+                    d / n as f32,
+                    w.get(w.len() / 2),
+                    w.len()
+                );
+            }
+        }
+        for tr in &a.tracks {
+            let ann = tr.fixes.iter().filter(|f| f.acc.is_some()).count();
+            println!(
+                "track {} fixes {} with acc {} first {:?}",
+                tr.id,
+                tr.fixes.len(),
+                ann,
+                tr.fixes.iter().find_map(|f| f.acc.as_deref())
+            );
+        }
+    }
+
+    #[test]
+    fn acceleration_end_to_end() {
+        let mut a = FinApp::blank();
+        a.load_demo();
+        let tr0 = a.tracks[0].clone();
+        let n = a.tracks.len();
+        a.add_file_from(
+            "acc.csv".into(),
+            eobs_for(&tr0).into_bytes(),
+            None,
+            Some(FileOrigin::Local),
+        );
+        assert_eq!(a.tracks.len(), n, "an ACC file adds no tracks");
+        assert_eq!(a.acc_sets.len(), 1);
+        a.acc_params.k = 2;
+        a.ensure_acc_cache();
+        assert_eq!(
+            a.acc_sets[0].track.as_deref(),
+            Some(a.track_key(0).as_str()),
+            "matched by id"
+        );
+        let annotated: Vec<&crate::acc::FixAcc> = a.tracks[0]
+            .fixes
+            .iter()
+            .filter_map(|f| f.acc.as_deref())
+            .collect();
+        assert!(annotated.len() > 3);
+        let early = annotated.first().unwrap();
+        let late = annotated.last().unwrap();
+        assert!(
+            early.flight_frac > 0.9 && late.flight_frac < 0.1,
+            "{early:?} {late:?}"
+        );
+        assert!((early.wbf_hz.unwrap() - 9.0).abs() < 0.5);
+        assert_ne!(early.cluster, late.cluster);
+        assert!(a.tracks[1].fixes.iter().all(|f| f.acc.is_none()));
+        // export columns
+        let mut tr = a.tracks[0].clone();
+        tr.fixes.retain(|f| f.acc.is_some());
+        // share round trip of settings and set state
+        a.acc_params.flight_g = 0.7;
+        a.acc_sets[0].clock_rate = 0.015;
+        let m = a.share_map(true);
+        let mut b = FinApp::blank();
+        b.load_demo();
+        b.add_file_from(
+            "acc.csv".into(),
+            eobs_for(&tr0).into_bytes(),
+            None,
+            Some(FileOrigin::Local),
+        );
+        b.apply_share_settings(&m);
+        b.apply_share_view(&m);
+        assert_eq!(b.acc_params, a.acc_params);
+        assert!((b.acc_sets[0].clock_rate - 0.015).abs() < 1e-9);
+        assert_eq!(b.acc_sets[0].track, a.acc_sets[0].track);
+        b.ensure_acc_cache();
+        assert!(b.tracks[0].fixes.iter().any(|f| f.acc.is_some()));
+    }
+
+    #[test]
+    fn open_meteo_error_classification() {
+        let over = r#"HTTP 503 {"reason":"The service is overloaded","error":true}"#;
+        assert!(matches!(
+            om_failure(over),
+            OmFailure::Transient { minute: false }
+        ));
+        assert_eq!(short_err(over), "HTTP 503 The service is overloaded");
+        assert!(matches!(
+            om_failure("Failed to fetch, check the developer console for details"),
+            OmFailure::Transient { .. }
+        ));
+        assert!(matches!(
+            om_failure("bad JSON: EOF while parsing"),
+            OmFailure::Transient { .. }
+        ));
+        assert!(matches!(
+            om_failure(
+                r#"HTTP 429 {"reason":"Minutely API request limit exceeded. Please try again in one minute.","error":true}"#
+            ),
+            OmFailure::Transient { minute: true }
+        ));
+        assert!(matches!(
+            om_failure(
+                r#"HTTP 429 {"reason":"Daily API request limit exceeded. Please try again tomorrow.","error":true}"#
+            ),
+            OmFailure::Daily
+        ));
+        assert!(matches!(
+            om_failure(
+                r#"HTTP 400 {"reason":"Parameter 'start_date' is out of allowed range","error":true}"#
+            ),
+            OmFailure::Permanent
+        ));
+    }
+
+    #[test]
+    fn overloaded_requests_back_off_and_are_kept() {
+        let mut a = FinApp::blank();
+        a.load_demo();
+        let ctx = egui::Context::default();
+        let pts = weather::sample_points(&a.tracks, &a.opts);
+        let req = a
+            .store
+            .plan(&pts, a.opts.model, weather::latest_available_day())
+            .remove(0);
+        let url = req.url.clone();
+        let over = r#"HTTP 503 {"reason":"The service is overloaded","error":true}"#;
+        for attempt in 1..=OM_RETRIES + 1 {
+            let job = a.queue.pop_front().unwrap_or(Job::Surface(req.clone()));
+            a.in_flight.insert(attempt as usize, job);
+            let _ = a.tx.send(Msg::Weather {
+                id: attempt as usize,
+                result: Err(over.to_string()),
+            });
+            a.process_messages(&ctx);
+            if attempt <= OM_RETRIES {
+                assert_eq!(a.queue.len(), 1, "re-queued for retry {attempt}");
+                assert!(a.pause_until > a.now, "backing off");
+                assert_eq!(a.om_parallel, 1, "one request at a time while overloaded");
+            }
+        }
+        assert!(a.queue.is_empty());
+        assert_eq!(a.failed_jobs.len(), 1, "kept for 'Retry failed'");
+        assert!(
+            a.store.days.is_empty(),
+            "failed cells are not marked as downloaded"
+        );
+        assert!(a.failed_jobs[0].url() == url);
+    }
+
+    #[test]
+    fn date_range_editor_parsing() {
+        let (a, b) = parse_date_range("2024-09-20", "2024-09-21").unwrap();
+        assert_eq!(fmt_time(a), "2024-09-20 00:00:00");
+        assert_eq!(fmt_time(b), "2024-09-21 23:59:59");
+        let (a, b) = parse_date_range("2024-09-20 19:10", " 2024-09-20 22:00 ").unwrap();
+        assert_eq!(fmt_time(a), "2024-09-20 19:10:00");
+        assert_eq!(fmt_time(b), "2024-09-20 22:00:59");
+        assert_eq!(fmt_minute(a), "2024-09-20 19:10");
+        assert!(parse_date_range("2024-09-22", "2024-09-21").is_err());
+        assert!(parse_date_range("soon", "2024-09-21").is_err());
+    }
+
+    fn without(m: &ShareMap, keys: &[&str]) -> Vec<(String, String)> {
+        m.pairs
+            .iter()
+            .filter(|p| !keys.contains(&p.0.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn share_link_restores_the_view() {
+        let mut a = FinApp::blank();
+        a.load_demo();
+        a.add_file_from(
+            "my_local.csv".into(),
+            crate::demo::grey_seal_csv().into_bytes(),
+            Some("movebank"),
+            Some(FileOrigin::Local),
+        );
+        assert_eq!(a.tracks.len(), 3);
+        a.view_tab = ViewTab::ThreeD;
+        a.t_now = a.t_min + 0.37 * (a.t_max - a.t_min);
+        a.speed_idx = 1;
+        a.basemap = Basemap::CartoDark;
+        a.sat_on = true;
+        a.sat_opacity = 0.5;
+        a.wind_palettes
+            .insert(Basemap::OpenStreetMap, WindPalette::Turbo);
+        a.color_by = ColorBy::Seafloor;
+        a.show_error = false;
+        a.follow = true;
+        a.view3d.follow = true;
+        a.max_error_km = 10.0;
+        a.chart_var = ChartVar::Sensor(SensorKind::Depth);
+        a.chart_subplots = vec![
+            ChartVar::Ocean(OceanVar::DiveMax),
+            ChartVar::Ocean(OceanVar::Sst),
+        ];
+        a.min_lc = ArgosLc::A;
+        a.dive_params.deep_m = 250.0;
+        a.overlay = Some(crate::tiles::Overlay::VesselsFishing);
+        a.sat_layer = SatLayer::Sst;
+        a.curtain_metric = CurtainMetric::Crosswind;
+        a.chart_open = false;
+        a.opts.field_margin_deg = 2.0;
+        a.opts.night_only = false;
+        a.field_radius_deg = 5.0;
+        a.field_step_cells = 2;
+        a.view3d.particles_per_level = 900;
+        a.view3d.ground_dim = 0.2;
+        a.view3d.cam.yaw = 33.0;
+        a.view3d.cam.pitch = 25.0;
+        a.view3d.cam.dist = 1234.0;
+        a.view3d.auto_exag = false;
+        a.view3d.exag = 400.0;
+        a.tracks[1].visible = false;
+        a.tracks[0].color = [1, 2, 3];
+        let (lo, hi) = a.tracks[2].time_range().unwrap();
+        let dr = (lo + (hi - lo) / 4, hi - (hi - lo) / 4);
+        a.set_date_filter(&[2], Some(dr));
+        assert!(!a.tracks[2].excluded_fixes.is_empty());
+        a.view3d.terrain = true;
+        a.st_on = true;
+        a.st_params.radius_m = 2500.0;
+        a.st_params.include_other = false;
+        a.st_highlight = false;
+        a.wx_field = crate::wxfield::FieldVar::Precip;
+        a.wx_isobars = true;
+        a.selected_track = Some(2);
+        a.selected = Some((0, 5));
+        a.map_center = Some((45.5, 7.25));
+        let _ = a.memory.set_zoom(6.5);
+
+        let url = a.share_url(true);
+        assert!(url.starts_with(share::WEB_APP_URL) && url.contains("#v=1&demo=1"));
+
+        let mut b = FinApp::blank();
+        b.start_from_share(&ShareMap::decode(&url));
+        assert_eq!(b.tracks.len(), 3);
+        assert_eq!(b.min_lc, ArgosLc::A);
+        assert_eq!(b.dive_params.deep_m, 250.0);
+        assert_eq!(b.overlay, Some(crate::tiles::Overlay::VesselsFishing));
+        assert_eq!(
+            b.files
+                .iter()
+                .filter(|f| f.origin == FileOrigin::Local)
+                .count(),
+            1
+        );
+        assert_eq!(
+            b.files
+                .iter()
+                .find(|f| f.name == "my_local.csv")
+                .unwrap()
+                .firmware,
+            "movebank"
+        );
+        assert!(!b.tracks[1].visible && b.tracks[0].color == [1, 2, 3]);
+        assert_eq!(b.tracks[2].date_filter, Some(dr));
+        assert_eq!(b.tracks[2].fixes.len(), a.tracks[2].fixes.len());
+        assert!(b.view3d.terrain);
+        assert_eq!(
+            b.chart_subplots,
+            vec![
+                ChartVar::Ocean(OceanVar::DiveMax),
+                ChartVar::Ocean(OceanVar::Sst)
+            ]
+        );
+        assert_eq!(b.wx_field, crate::wxfield::FieldVar::Precip);
+        assert!(b.wx_isobars && !b.wx_centres);
+        assert!(
+            b.st_on
+                && b.st_params.radius_m == 2500.0
+                && !b.st_params.include_other
+                && !b.st_highlight
+        );
+        assert_eq!(b.selected, Some((0, 5)));
+        assert_eq!(b.selected_track, Some(2));
+        assert_eq!(b.t_now, a.t_now.round());
+        assert_eq!(b.memory.zoom(), 6.5);
+        let c = b.memory.detached().expect("map centred from the link");
+        assert!((c.y() - 45.5).abs() < 1e-9 && (c.x() - 7.25).abs() < 1e-9);
+        // Everything else encodes identically (map / cam are applied on the first frame).
+        b.map_center = a.map_center;
+        b.view3d.cam = a.view3d.cam.clone();
+        b.view3d.exag = a.view3d.exag;
+        b.view3d.auto_exag = a.view3d.auto_exag;
+        let (ma, mb) = (
+            without(&a.share_map(true), &["emb"]),
+            without(&b.share_map(true), &["emb"]),
+        );
+        let diff: Vec<_> = ma.iter().zip(mb.iter()).filter(|(x, y)| x != y).collect();
+        assert!(diff.is_empty() && ma.len() == mb.len(), "{diff:?}");
+        assert_eq!(
+            without(&a.share_map(true), &[]),
+            without(&b.share_map(true), &[])
+        );
+    }
+
+    #[test]
+    fn link_without_data_or_with_bad_data_is_harmless() {
+        let mut b = FinApp::blank();
+        b.start_from_share(&ShareMap::decode(
+            "#v=1&tab=3d&emb=%%%garbage&cb=Nope&t=abc",
+        ));
+        assert!(b.tracks.is_empty());
+        assert_eq!(b.view_tab, ViewTab::ThreeD);
+        assert_eq!(b.color_by, ColorBy::Individual);
+    }
+}

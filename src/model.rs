@@ -1,0 +1,558 @@
+//! Core data model shared by all firmware parsers, the ocean / weather annotators and the UI.
+//!
+//! Every parser turns its input into a list of [`Track`]s. A track is one animal / tag
+//! deployment and holds location [`Fix`]es (GPS, Argos) plus non-location
+//! [`SensorSample`]s (depth, temperature, VeDBA) that tags record far more often than they
+//! get a position.
+
+/// How a fix was located. Drives how much the UI and the annotator trust it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocationSource {
+    /// Satellite GPS fix (including Fastloc GPS).
+    Gps,
+    /// Argos Doppler location (location class and, for Kalman-filter locations, an error
+    /// ellipse in [`Fix::argos`]).
+    Argos,
+    /// Position of a receiving station (e.g. an acoustic receiver).
+    Station,
+    /// Anything else (e.g. deployment site, manually entered, light-level geolocation).
+    Other,
+}
+
+impl LocationSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            LocationSource::Gps => "GPS",
+            LocationSource::Argos => "Argos",
+            LocationSource::Station => "Station",
+            LocationSource::Other => "Other",
+        }
+    }
+}
+
+/// Where an altitude value came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AltitudeSource {
+    /// GPS height (above ellipsoid / MSL as delivered by the tag).
+    Gps,
+    /// Barometric altitude from an instantaneous pressure reading.
+    PressureInstant,
+    /// Barometric altitude from a *minimum* pressure over a window
+    /// (NanoFox: 3 h, TinyFox: 24 h) i.e. the maximum altitude reached in that window.
+    PressureWindowMin,
+}
+
+impl AltitudeSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            AltitudeSource::Gps => "GPS height",
+            AltitudeSource::PressureInstant => "barometric",
+            AltitudeSource::PressureWindowMin => "barometric (window max)",
+        }
+    }
+}
+
+/// Argos location class (CLS): accuracy decreases from 3 to B; Z is invalid. `G` marks a
+/// GPS position delivered through Argos.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ArgosLc {
+    Z,
+    B,
+    A,
+    Lc0,
+    Lc1,
+    Lc2,
+    Lc3,
+    G,
+}
+
+impl ArgosLc {
+    pub const ALL: [ArgosLc; 8] = [
+        ArgosLc::G,
+        ArgosLc::Lc3,
+        ArgosLc::Lc2,
+        ArgosLc::Lc1,
+        ArgosLc::Lc0,
+        ArgosLc::A,
+        ArgosLc::B,
+        ArgosLc::Z,
+    ];
+    pub fn parse(s: &str) -> Option<ArgosLc> {
+        Some(
+            match s
+                .trim()
+                .trim_start_matches("LC")
+                .trim_start_matches("lc")
+                .trim()
+            {
+                "3" => ArgosLc::Lc3,
+                "2" => ArgosLc::Lc2,
+                "1" => ArgosLc::Lc1,
+                "0" => ArgosLc::Lc0,
+                "A" | "a" | "-1" => ArgosLc::A,
+                "B" | "b" | "-2" => ArgosLc::B,
+                "Z" | "z" | "-9" => ArgosLc::Z,
+                "G" | "g" => ArgosLc::G,
+                _ => return None,
+            },
+        )
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            ArgosLc::G => "G",
+            ArgosLc::Lc3 => "3",
+            ArgosLc::Lc2 => "2",
+            ArgosLc::Lc1 => "1",
+            ArgosLc::Lc0 => "0",
+            ArgosLc::A => "A",
+            ArgosLc::B => "B",
+            ArgosLc::Z => "Z",
+        }
+    }
+    /// Typical error radius (m) when the file has no error estimate: CLS nominal accuracy
+    /// for classes 3–1 and approximate field values for 0 / A / B (Costa et al. 2010).
+    pub fn nominal_error_m(self) -> f32 {
+        match self {
+            ArgosLc::G => 50.0,
+            ArgosLc::Lc3 => 250.0,
+            ArgosLc::Lc2 => 500.0,
+            ArgosLc::Lc1 => 1500.0,
+            ArgosLc::Lc0 => 4000.0,
+            ArgosLc::A => 6000.0,
+            ArgosLc::B => 10000.0,
+            ArgosLc::Z => 20000.0,
+        }
+    }
+}
+
+/// Argos details of a fix.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArgosInfo {
+    pub lc: ArgosLc,
+    /// Kalman-filter error ellipse (m, degrees clockwise from north), when delivered.
+    pub semi_major_m: Option<f32>,
+    pub semi_minor_m: Option<f32>,
+    pub orientation_deg: Option<f32>,
+}
+
+/// Environmental annotation of a single fix (filled by [`crate::weather`], [`crate::marine`]
+/// and the bathymetry sampler).
+#[derive(Clone, Debug, Default)]
+pub struct WeatherAnno {
+    /// Wind u/v (m/s, *towards* east / north) at the level used for this fix.
+    pub u: Option<f32>,
+    pub v: Option<f32>,
+    /// Which level the wind was taken from ("10m" / "100m" / "imported").
+    pub level: Option<&'static str>,
+    pub wind_speed: Option<f32>,
+    /// Meteorological wind direction (degrees the wind blows *from*).
+    pub wind_from_deg: Option<f32>,
+    /// Tailwind (+) / headwind (−) component along the track heading (m/s).
+    pub wind_support: Option<f32>,
+    /// Crosswind component (m/s, + = from the left / pushing to the right).
+    pub crosswind: Option<f32>,
+    /// Airspeed estimate = |ground velocity − wind velocity| (m/s).
+    pub airspeed: Option<f32>,
+    pub temp_2m: Option<f32>,
+    pub msl_hpa: Option<f32>,
+    pub surface_pressure_hpa: Option<f32>,
+    pub precipitation_mm: Option<f32>,
+    pub cloud_cover: Option<f32>,
+    pub dew_point_2m: Option<f32>,
+    /// Low cloud and fog (up to ~2 km), %.
+    pub cloud_cover_low: Option<f32>,
+    /// Cloud base (lifting condensation level), m above sea level — see
+    /// [`crate::weather::cloud_base_m`].
+    pub cloud_base_m: Option<f32>,
+    /// Mean wind support / crosswind along the segment that *ended* at this fix,
+    /// sampled hourly along the interpolated path (night hours only if requested).
+    pub seg_wind_support: Option<f32>,
+    pub seg_crosswind: Option<f32>,
+    pub seg_hours: Option<u16>,
+    /// Barometric altitude recomputed with the local ERA5 mean-sea-level pressure.
+    pub alt_msl_corrected: Option<f32>,
+    /// Ocean state from the Open-Meteo Marine API ([`crate::marine`]).
+    pub marine: Option<MarineAnno>,
+    /// Seafloor elevation under the fix (m, negative = depth below sea level) from the
+    /// Terrarium elevation tiles (GEBCO / SRTM15+ / ETOPO in the ocean).
+    pub seafloor_m: Option<f32>,
+    /// Pressure-level ("3D") wind at flight altitude — see [`crate::wind3d`].
+    /// Names follow `SigfoxTagPrep::annotate_era5()`.
+    pub flight: Option<FlightWind>,
+}
+
+/// Ocean conditions at a fix (hourly model values at the nearest sea cell).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MarineAnno {
+    /// Significant wave height (m), mean direction (° from), mean period (s).
+    pub wave_height_m: Option<f32>,
+    pub wave_from_deg: Option<f32>,
+    pub wave_period_s: Option<f32>,
+    pub swell_height_m: Option<f32>,
+    /// Surface current speed (m/s) and the direction it flows *towards* (°).
+    pub current_ms: Option<f32>,
+    pub current_to_deg: Option<f32>,
+    /// Current component along / across the animal's heading (m/s, + = assisting / to the right).
+    pub current_support: Option<f32>,
+    pub current_cross: Option<f32>,
+    pub sst_c: Option<f32>,
+    /// Sea level incl. tides relative to mean sea level (m).
+    pub sea_level_m: Option<f32>,
+}
+
+/// Wind at the animal's flight altitude and at the best available pressure level.
+#[derive(Clone, Debug, Default)]
+pub struct FlightWind {
+    /// Pressure the animal flew at (tag barometer, or GPS altitude converted with the profile).
+    pub flight_pressure_hpa: f32,
+    /// Height (m above sea level) of that pressure in the wind profile.
+    pub flight_height_m: Option<f32>,
+    /// Nearest pressure level to the flight pressure (as in `annotate_era5()`).
+    pub matched_level_hpa: f32,
+    pub u: f32,
+    pub v: f32,
+    pub wind_speed: f32,
+    pub wind_support: Option<f32>,
+    pub crosswind: Option<f32>,
+    pub airspeed: Option<f32>,
+    /// Above-ground level with the strongest wind support for this heading.
+    pub best_level_hpa: Option<f32>,
+    pub best_level_height_m: Option<f32>,
+    pub best_wind_support: Option<f32>,
+    pub at_best_wind: Option<bool>,
+    /// Data source label, e.g. "Open-Meteo gfs_seamless" or "ERA5 file".
+    pub source: String,
+}
+
+/// One location fix.
+#[derive(Clone, Debug)]
+pub struct Fix {
+    /// Unix seconds, UTC.
+    pub t: i64,
+    pub lat: f64,
+    pub lon: f64,
+    pub source: LocationSource,
+    /// Horizontal error radius in metres (Sigfox radius, GPS HDOP-derived, ...).
+    pub error_m: Option<f32>,
+    pub alt_m: Option<f32>,
+    pub alt_source: Option<AltitudeSource>,
+    /// Pressure (hPa) the altitude was derived from, if barometric.
+    pub pressure_hpa: Option<f32>,
+    /// Ground speed / heading reported by the tag (GPS units only).
+    pub reported_speed_ms: Option<f32>,
+    pub reported_heading: Option<f32>,
+    pub temp_c: Option<f32>,
+    /// Activity, in the units the tag delivers (VeDBA sum, activity %, ...).
+    pub activity: Option<f32>,
+    /// Derived from consecutive fixes.
+    pub step_m: Option<f32>,
+    pub dt_s: Option<f32>,
+    pub ground_speed_ms: Option<f32>,
+    /// Bearing (degrees from north) of the step *arriving* at this fix.
+    pub bearing_deg: Option<f32>,
+    /// True if the step is larger than the combined location error (i.e. real movement).
+    pub step_significant: bool,
+    pub weather: WeatherAnno,
+    /// Extra columns kept for export / display (name, value).
+    pub extra: Vec<(String, String)>,
+    /// Acceleration summary of the step arriving at this fix ([`crate::acc`]).
+    pub acc: Option<Box<crate::acc::FixAcc>>,
+    /// Results of movement analyses the user ran ([`crate::movement`]).
+    pub mv: Option<Box<MoveAnno>>,
+    /// Argos location class and error ellipse.
+    pub argos: Option<ArgosInfo>,
+    /// Depth (m, positive down) recorded with the fix, if any.
+    pub depth_m: Option<f32>,
+    /// Removed by the Argos speed filter ([`crate::dives::speed_filter`]).
+    pub speed_outlier: bool,
+}
+
+/// Per-fix output of the on-demand movement analyses (all optional).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MoveAnno {
+    /// HMM state of the step arriving at this fix (0 = slowest).
+    pub hmm_state: Option<u8>,
+    /// Change-point segment (0-based, in time order).
+    pub segment: Option<u16>,
+    /// First-passage time (hours) at the chosen radius.
+    pub fpt_h: Option<f32>,
+}
+
+impl Fix {
+    pub fn new(t: i64, lat: f64, lon: f64, source: LocationSource) -> Self {
+        Fix {
+            t,
+            lat,
+            lon,
+            source,
+            error_m: None,
+            alt_m: None,
+            alt_source: None,
+            pressure_hpa: None,
+            reported_speed_ms: None,
+            reported_heading: None,
+            temp_c: None,
+            activity: None,
+            step_m: None,
+            dt_s: None,
+            ground_speed_ms: None,
+            bearing_deg: None,
+            step_significant: true,
+            weather: WeatherAnno::default(),
+            extra: Vec::new(),
+            acc: None,
+            mv: None,
+            argos: None,
+            depth_m: None,
+            speed_outlier: false,
+        }
+    }
+
+    /// Movement annotations, created on first write.
+    pub fn mv_mut(&mut self) -> &mut MoveAnno {
+        self.mv.get_or_insert_with(Default::default)
+    }
+
+    /// The best altitude estimate available (ERA5-corrected barometric first).
+    pub fn best_alt(&self) -> Option<f32> {
+        self.weather.alt_msl_corrected.or(self.alt_m)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SensorKind {
+    Vedba,
+    Temperature,
+    Pressure,
+    Activity,
+    /// Depth below the surface (m, positive down).
+    Depth,
+    /// Light level (raw tag units).
+    Light,
+}
+
+impl SensorKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            SensorKind::Vedba => "VeDBA",
+            SensorKind::Temperature => "Tag temperature (°C)",
+            SensorKind::Pressure => "Pressure (hPa)",
+            SensorKind::Activity => "Activity (%)",
+            SensorKind::Depth => "Depth (m)",
+            SensorKind::Light => "Light level",
+        }
+    }
+}
+
+/// A non-location measurement (e.g. one of the five 36-min VeDBA bins of a NanoFox message).
+#[derive(Clone, Debug)]
+pub struct SensorSample {
+    /// Centre of the measurement window, unix seconds UTC.
+    pub t: i64,
+    pub kind: SensorKind,
+    pub value: f32,
+}
+
+/// One animal / tag deployment.
+#[derive(Clone, Debug)]
+pub struct Track {
+    pub id: String,
+    /// Tag hardware (TinyFox, NanoFox, uWasp, CTT, GPS, ...).
+    pub tag: String,
+    /// Firmware profile that parsed it (see [`crate::firmware`]).
+    pub firmware: String,
+    pub species: Option<String>,
+    pub fixes: Vec<Fix>,
+    pub sensors: Vec<SensorSample>,
+    pub visible: bool,
+    pub color: [u8; 3],
+    /// Source file name (set by the app; used to re-parse with a different firmware profile).
+    pub file: String,
+    /// Inclusive time window (unix s) the user restricted this track to; `None` = all data.
+    pub date_filter: Option<(i64, i64)>,
+    /// Fixes / sensor samples set aside by [`Track::set_date_filter`], restored when it changes.
+    pub excluded_fixes: Vec<Fix>,
+    pub excluded_sensors: Vec<SensorSample>,
+}
+
+impl Track {
+    pub fn new(id: impl Into<String>, tag: impl Into<String>, firmware: impl Into<String>) -> Self {
+        Track {
+            id: id.into(),
+            tag: tag.into(),
+            firmware: firmware.into(),
+            species: None,
+            fixes: Vec::new(),
+            sensors: Vec::new(),
+            visible: true,
+            color: [200, 200, 200],
+            file: String::new(),
+            date_filter: None,
+            excluded_fixes: Vec::new(),
+            excluded_sensors: Vec::new(),
+        }
+    }
+
+    pub fn time_range(&self) -> Option<(i64, i64)> {
+        let first = self.fixes.first()?.t;
+        let last = self.fixes.last()?.t;
+        Some((first, last))
+    }
+
+    /// Time range of all data, including fixes hidden by the date filter.
+    pub fn full_time_range(&self) -> Option<(i64, i64)> {
+        self.fixes
+            .iter()
+            .chain(&self.excluded_fixes)
+            .map(|f| f.t)
+            .fold(None, |r, t| match r {
+                None => Some((t, t)),
+                Some((a, b)) => Some((a.min(t), b.max(t))),
+            })
+    }
+
+    /// Keep only fixes and sensor samples inside `range` (inclusive); `None` restores all.
+    /// Set-aside data keeps its annotations, and step metrics are recomputed so speeds and
+    /// bearings never span a removed stretch.
+    pub fn set_date_filter(&mut self, range: Option<(i64, i64)>) {
+        self.fixes.append(&mut self.excluded_fixes);
+        self.fixes.sort_by_key(|f| f.t);
+        self.sensors.append(&mut self.excluded_sensors);
+        self.sensors.sort_by_key(|s| (s.kind, s.t));
+        self.date_filter = range;
+        if let Some((a, b)) = range {
+            let inside = |t: i64| t >= a && t <= b;
+            let (keep, out): (Vec<Fix>, Vec<Fix>) = std::mem::take(&mut self.fixes)
+                .into_iter()
+                .partition(|f| inside(f.t));
+            self.fixes = keep;
+            self.excluded_fixes = out;
+            let (keep, out): (Vec<SensorSample>, Vec<SensorSample>) =
+                std::mem::take(&mut self.sensors)
+                    .into_iter()
+                    .partition(|s| inside(s.t));
+            self.sensors = keep;
+            self.excluded_sensors = out;
+        }
+        self.compute_steps();
+    }
+
+    /// Sort fixes/sensors by time, drop exact duplicates, and compute step metrics.
+    pub fn finalize(&mut self) {
+        self.fixes.sort_by_key(|f| f.t);
+        self.fixes.dedup_by(|a, b| {
+            a.t == b.t && (a.lat - b.lat).abs() < 1e-9 && (a.lon - b.lon).abs() < 1e-9
+        });
+        self.sensors.sort_by_key(|s| (s.kind, s.t));
+        // Same-time samples with different values are kept (e.g. 3 h min + max temperature).
+        self.sensors
+            .dedup_by(|a, b| a.kind == b.kind && a.t == b.t && a.value == b.value);
+        self.compute_steps();
+    }
+
+    pub fn compute_steps(&mut self) {
+        for i in 0..self.fixes.len() {
+            if i == 0 {
+                let f = &mut self.fixes[0];
+                f.step_m = None;
+                f.dt_s = None;
+                f.ground_speed_ms = f.reported_speed_ms;
+                f.bearing_deg = f.reported_heading;
+                continue;
+            }
+            let (a, b) = {
+                let (l, r) = self.fixes.split_at_mut(i);
+                (&l[i - 1], &mut r[0])
+            };
+            let d = crate::geo::haversine_m(a.lat, a.lon, b.lat, b.lon);
+            let dt = (b.t - a.t) as f64;
+            b.step_m = Some(d as f32);
+            b.dt_s = Some(dt as f32);
+            b.ground_speed_ms = b.reported_speed_ms.or(if dt > 0.0 {
+                Some((d / dt) as f32)
+            } else {
+                None
+            });
+            b.bearing_deg = b.reported_heading.or(Some(crate::geo::bearing_deg(
+                a.lat, a.lon, b.lat, b.lon,
+            ) as f32));
+            let err = a.error_m.unwrap_or(0.0) + b.error_m.unwrap_or(0.0);
+            b.step_significant = (d as f32) > err.max(1.0);
+        }
+    }
+
+    /// Interpolated position at time `t` (None outside the track's time range).
+    pub fn position_at(&self, t: f64) -> Option<(f64, f64, usize)> {
+        let fx = &self.fixes;
+        if fx.is_empty() || t < fx[0].t as f64 || t > fx[fx.len() - 1].t as f64 {
+            return None;
+        }
+        let idx = fx.partition_point(|f| (f.t as f64) <= t);
+        if idx == 0 {
+            return Some((fx[0].lat, fx[0].lon, 0));
+        }
+        if idx >= fx.len() {
+            let l = &fx[fx.len() - 1];
+            return Some((l.lat, l.lon, fx.len() - 1));
+        }
+        let a = &fx[idx - 1];
+        let b = &fx[idx];
+        let span = (b.t - a.t) as f64;
+        let w = if span > 0.0 {
+            (t - a.t as f64) / span
+        } else {
+            0.0
+        };
+        let (lat, lon) = crate::geo::interpolate(a.lat, a.lon, b.lat, b.lon, w);
+        Some((lat, lon, idx - 1))
+    }
+}
+
+/// Result of parsing one file.
+#[derive(Debug, Default)]
+pub struct ParseOutput {
+    pub tracks: Vec<Track>,
+    pub warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_filter_sets_aside_and_restores() {
+        let mut tr = Track::new("a", "TinyFox", "test");
+        for (i, t) in [0, 100, 200, 300, 400].into_iter().enumerate() {
+            let mut f = Fix::new(t, 47.0 + i as f64 * 0.1, 9.0, LocationSource::Argos);
+            f.extra.push(("n".into(), i.to_string()));
+            tr.fixes.push(f);
+            tr.sensors.push(SensorSample {
+                t,
+                kind: SensorKind::Vedba,
+                value: i as f32,
+            });
+        }
+        tr.finalize();
+        tr.set_date_filter(Some((100, 300)));
+        assert_eq!(
+            tr.fixes.iter().map(|f| f.t).collect::<Vec<_>>(),
+            vec![100, 200, 300]
+        );
+        assert_eq!(tr.sensors.len(), 3);
+        assert_eq!(tr.excluded_fixes.len(), 2);
+        // first kept fix starts a fresh step (no speed across the removed stretch)
+        assert!(tr.fixes[0].step_m.is_none());
+        assert_eq!(tr.full_time_range(), Some((0, 400)));
+        // narrowing again starts from all data, not the current subset
+        tr.set_date_filter(Some((0, 150)));
+        assert_eq!(
+            tr.fixes.iter().map(|f| f.t).collect::<Vec<_>>(),
+            vec![0, 100]
+        );
+        tr.set_date_filter(None);
+        assert_eq!(tr.fixes.len(), 5);
+        assert!(tr.excluded_fixes.is_empty() && tr.excluded_sensors.is_empty());
+        assert_eq!(tr.fixes[3].extra[0].1, "3");
+        assert!(tr.fixes[1].step_m.is_some());
+    }
+}

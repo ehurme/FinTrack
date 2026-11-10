@@ -1,0 +1,1536 @@
+//! 3D view: tilted basemap, wind-speed raster, stacked pressure-level planes with flowing
+//! particles, and tracks drawn at flight altitude with drop lines.
+//!
+//! Everything is projected on the CPU and painted with egui (no extra GPU code), so it runs
+//! unchanged on desktop and in the browser. Depth sorting is by layer: ground → raster →
+//! planes/particles (low → high) → tracks → markers.
+
+use crate::geo;
+use crate::model::Track;
+use crate::wind3d::FieldSlice;
+use egui::{
+    Align2, Color32, FontId, Mesh, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, pos2, vec2,
+};
+use walkers::{Tile, TileId, Tiles};
+
+const EARTH_KM: f64 = 6371.0088;
+
+/// One colour per displayed level, lowest first: cyan, white, amber, magenta, lime.
+/// Used for particles, plane outlines, labels and the caption, so levels are easy to tell apart.
+pub const LEVEL_COLORS: [[u8; 3]; 5] = [
+    [80, 215, 255],
+    [245, 245, 245],
+    [255, 185, 60],
+    [255, 105, 200],
+    [150, 255, 110],
+];
+
+pub fn level_color(k: usize, alpha: u8) -> Color32 {
+    let c = LEVEL_COLORS[k % LEVEL_COLORS.len()];
+    Color32::from_rgba_unmultiplied(c[0], c[1], c[2], alpha)
+}
+
+#[derive(Clone, Debug)]
+pub struct Camera {
+    /// Heading the camera looks towards (degrees from north).
+    pub yaw: f32,
+    /// Angle above the horizon the camera looks down from (degrees).
+    pub pitch: f32,
+    /// Distance from the target (km).
+    pub dist: f32,
+    /// Look-at point, local ENU km.
+    pub target: [f32; 3],
+    pub fov_deg: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Camera {
+            yaw: 0.0,
+            pitch: 42.0,
+            dist: 800.0,
+            target: [0.0; 3],
+            fov_deg: 45.0,
+        }
+    }
+}
+
+struct Particle {
+    lat: f64,
+    lon: f64,
+    trail: Vec<(f64, f64)>,
+    age: u32,
+    max_age: u32,
+}
+
+/// Camera, exaggeration, auto flag and origin from a shared link.
+type PendingCam = (Camera, Option<f32>, Option<bool>, Option<(f64, f64)>);
+
+pub struct View3D {
+    pub cam: Camera,
+    /// Vertical exaggeration.
+    pub exag: f32,
+    /// Choose the exaggeration so the stack of levels is ~20 % as tall as the field is wide.
+    pub auto_exag: bool,
+    pub ground_dim: f32,
+    pub show_raster: bool,
+    /// Which displayed level (index into the slice levels) colours the ground raster.
+    pub raster_level: usize,
+    pub show_planes: bool,
+    pub particles_on: bool,
+    pub particles_per_level: usize,
+    /// Simulated hours of wind transport per real second.
+    pub flow_hours_per_s: f32,
+    pub show_drop_lines: bool,
+    pub show_shadows: bool,
+    /// Cloud deck at the cloud base (LCL) where ERA5 has low cloud.
+    pub show_clouds: bool,
+    /// Altitude (m) used for fixes without any altitude.
+    pub default_alt_m: f32,
+    /// A step is "not detected" (dotted) when longer than this × the track's median interval.
+    pub gap_factor: f32,
+    pub follow: bool,
+    /// Drape the basemap over real terrain (AWS Terrain Tiles), hill-shaded.
+    pub terrain: bool,
+    terrain_src: crate::terrain::Terrain,
+    /// Camera from a shared link, applied right after the first fit (which sets the origin).
+    pending_cam: Option<PendingCam>,
+    origin: Option<(f64, f64)>,
+    needs_fit: bool,
+    particles: Vec<Vec<Particle>>,
+    particle_levels: Vec<usize>,
+    rng: u64,
+}
+
+impl Default for View3D {
+    fn default() -> Self {
+        View3D {
+            cam: Camera::default(),
+            exag: 40.0,
+            auto_exag: true,
+            ground_dim: 0.45,
+            show_raster: true,
+            raster_level: 0,
+            show_planes: true,
+            particles_on: true,
+            particles_per_level: 700,
+            flow_hours_per_s: 3.0,
+            show_drop_lines: true,
+            show_shadows: true,
+            show_clouds: false,
+            default_alt_m: 0.0,
+            gap_factor: 2.5,
+            follow: false,
+            terrain: true,
+            terrain_src: crate::terrain::Terrain::default(),
+            pending_cam: None,
+            origin: None,
+            needs_fit: true,
+            particles: Vec::new(),
+            particle_levels: Vec::new(),
+            rng: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+}
+
+/// Everything the 3D view needs from the app for one frame.
+pub struct Scene<'a> {
+    pub tracks: &'a [Track],
+    pub t_now: f64,
+    pub trail_to_cursor: bool,
+    pub selected: Option<(usize, usize)>,
+    pub focus_track: Option<usize>,
+    pub slice: Option<&'a FieldSlice>,
+    /// Pressure (hPa) of each slice level, for labels.
+    pub slice_level_hpa: Vec<f32>,
+    pub base: Option<&'a mut dyn Tiles>,
+    pub sat: Option<(&'a mut dyn Tiles, f32)>,
+    pub source_label: String,
+    pub basemap_attribution: String,
+    pub max_error_m: f32,
+    /// Cloud base (m ASL) and low cloud cover (%) on the ERA5 lattice at the cursor hour.
+    pub clouds: Option<(crate::wxfield::Grid, crate::wxfield::Grid)>,
+    /// Wind turbines & tall structures to draw at their heights.
+    pub structures: Option<crate::structures::Draw<'a>>,
+    /// Dive profiles under the track: (lat, lon, depth m positive down) per sample.
+    pub dives: Vec<DivePath>,
+}
+
+/// One dive drawn below the sea surface.
+pub struct DivePath {
+    pub pts: Vec<(f64, f64, f32)>,
+    pub max_depth: f32,
+    /// Track colour, for the surface marker.
+    pub color: Color32,
+    /// Deeper than the "deep dive" threshold.
+    pub deep: bool,
+    /// The dive under the time cursor.
+    pub current: bool,
+}
+
+/// Depth (m, positive down) → colour (light cyan at the surface → navy at 6000 m, log scale).
+pub fn depth_color(d: f32, alpha: u8) -> Color32 {
+    let [r, g, b] = crate::dives::depth_rgb(d);
+    Color32::from_rgba_unmultiplied(r, g, b, alpha)
+}
+
+#[derive(Default)]
+pub struct Output {
+    pub hover: Option<(usize, usize, Pos2)>,
+    pub clicked: Option<(usize, usize)>,
+}
+
+struct Proj {
+    lat0: f64,
+    lon0: f64,
+    coslat: f64,
+    exag: f32,
+    eye: [f32; 3],
+    f: [f32; 3],
+    r: [f32; 3],
+    u: [f32; 3],
+    center: Pos2,
+    scale: f32,
+}
+
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn norm(a: [f32; 3]) -> [f32; 3] {
+    let l = dot(a, a).sqrt().max(1e-9);
+    [a[0] / l, a[1] / l, a[2] / l]
+}
+
+impl Proj {
+    fn new(cam: &Camera, origin: (f64, f64), exag: f32, rect: Rect) -> Proj {
+        let (yaw, pitch) = (
+            cam.yaw.to_radians(),
+            cam.pitch.clamp(3.0, 89.9).to_radians(),
+        );
+        let f = [
+            yaw.sin() * pitch.cos(),
+            yaw.cos() * pitch.cos(),
+            -pitch.sin(),
+        ];
+        let eye = [
+            cam.target[0] - f[0] * cam.dist,
+            cam.target[1] - f[1] * cam.dist,
+            cam.target[2] - f[2] * cam.dist,
+        ];
+        let r = norm(cross(f, [0.0, 0.0, 1.0]));
+        let u = cross(r, f);
+        let scale = (rect.height() / 2.0) / (cam.fov_deg.to_radians() / 2.0).tan();
+        Proj {
+            lat0: origin.0,
+            lon0: origin.1,
+            coslat: origin.0.to_radians().cos(),
+            exag,
+            eye,
+            f,
+            r,
+            u,
+            center: rect.center(),
+            scale,
+        }
+    }
+    fn enu(&self, lat: f64, lon: f64, alt_m: f32) -> [f32; 3] {
+        let x = (lon - self.lon0).to_radians() * EARTH_KM * self.coslat;
+        let y = (lat - self.lat0).to_radians() * EARTH_KM;
+        [x as f32, y as f32, alt_m / 1000.0 * self.exag]
+    }
+    fn latlon(&self, x: f32, y: f32) -> (f64, f64) {
+        (
+            self.lat0 + (y as f64 / EARTH_KM).to_degrees(),
+            self.lon0 + (x as f64 / (EARTH_KM * self.coslat)).to_degrees(),
+        )
+    }
+    fn project(&self, p: [f32; 3]) -> Option<Pos2> {
+        let d = sub(p, self.eye);
+        let zc = dot(d, self.f);
+        if zc < 1.0 {
+            return None;
+        }
+        Some(pos2(
+            self.center.x + dot(d, self.r) / zc * self.scale,
+            self.center.y - dot(d, self.u) / zc * self.scale,
+        ))
+    }
+    fn geo(&self, lat: f64, lon: f64, alt_m: f32) -> Option<Pos2> {
+        self.project(self.enu(lat, lon, alt_m))
+    }
+}
+
+/// Wind-speed ramp (m/s) similar to common wind maps: teal → green → yellow → red → purple.
+pub fn wind_color(speed: f32, alpha: u8) -> Color32 {
+    const S: [(f32, [u8; 3]); 6] = [
+        (0.0, [30, 60, 90]),
+        (5.0, [40, 140, 120]),
+        (10.0, [150, 190, 60]),
+        (15.0, [240, 200, 40]),
+        (20.0, [230, 80, 40]),
+        (28.0, [150, 30, 120]),
+    ];
+    let s = speed.clamp(0.0, 28.0);
+    let mut c = S[5].1;
+    for w in S.windows(2) {
+        if s <= w[1].0 {
+            let f = (s - w[0].0) / (w[1].0 - w[0].0);
+            let l = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f) as u8;
+            c = [
+                l(w[0].1[0], w[1].1[0]),
+                l(w[0].1[1], w[1].1[1]),
+                l(w[0].1[2], w[1].1[2]),
+            ];
+            break;
+        }
+    }
+    Color32::from_rgba_unmultiplied(c[0], c[1], c[2], alpha)
+}
+
+fn tile_lat(y: f64, z: u8) -> f64 {
+    let n = std::f64::consts::PI * (1.0 - 2.0 * y / (1u64 << z) as f64);
+    n.sinh().atan().to_degrees()
+}
+fn tile_lon(x: f64, z: u8) -> f64 {
+    x / (1u64 << z) as f64 * 360.0 - 180.0
+}
+fn lon_to_tile(lon: f64, z: u8) -> f64 {
+    (lon + 180.0) / 360.0 * (1u64 << z) as f64
+}
+fn lat_to_tile(lat: f64, z: u8) -> f64 {
+    let r = lat.clamp(-85.0, 85.0).to_radians();
+    (1.0 - (r.tan() + 1.0 / r.cos()).ln() / std::f64::consts::PI) / 2.0 * (1u64 << z) as f64
+}
+
+impl View3D {
+    pub fn request_fit(&mut self) {
+        self.needs_fit = true;
+    }
+
+    /// Restore a camera (from a shared link) once the view has been fitted to the data.
+    pub fn set_camera_after_fit(
+        &mut self,
+        cam: Camera,
+        exag: Option<f32>,
+        auto_exag: Option<bool>,
+        origin: Option<(f64, f64)>,
+    ) {
+        self.pending_cam = Some((cam, exag, auto_exag, origin));
+    }
+
+    /// Reference point (lat, lon) the camera coordinates are relative to.
+    pub fn origin(&self) -> Option<(f64, f64)> {
+        self.origin
+    }
+
+    fn rand(&mut self) -> f64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn fit(&mut self, scene: &Scene) {
+        let (mut s, mut n, mut w, mut e) = (90.0f64, -90.0f64, 180.0f64, -180.0f64);
+        for (i, tr) in scene.tracks.iter().enumerate() {
+            if !tr.visible || scene.focus_track.is_some_and(|f| f != i) {
+                continue;
+            }
+            for f in &tr.fixes {
+                s = s.min(f.lat);
+                n = n.max(f.lat);
+                w = w.min(f.lon);
+                e = e.max(f.lon);
+            }
+        }
+        if s > n {
+            return;
+        }
+        let lat0 = (s + n) / 2.0;
+        self.origin = Some((lat0, (w + e) / 2.0));
+        let ext = ((n - s).to_radians() * EARTH_KM)
+            .max((e - w).to_radians() * EARTH_KM * lat0.to_radians().cos())
+            .max(50.0);
+        self.cam.target = [0.0, 0.0, 0.0];
+        self.cam.dist =
+            (ext as f32) * 1.15 / (self.cam.fov_deg.to_radians() / 2.0).tan() / 2.0 + 50.0;
+        self.cam.yaw = 0.0;
+        self.cam.pitch = 42.0;
+        self.needs_fit = false;
+    }
+
+    fn controls(&mut self, ui: &Ui, resp: &Response) {
+        // Two-finger touch: pan, pinch-zoom and twist to rotate.
+        if let Some(mt) = ui.input(|i| i.multi_touch())
+            && mt.num_touches >= 2
+            && resp.rect.contains(mt.center_pos)
+        {
+            let d = mt.translation_delta;
+            let k = self.cam.dist / 700.0;
+            let (sy, cy) = self.cam.yaw.to_radians().sin_cos();
+            self.cam.target[0] -= (d.x * cy - d.y * sy) * k;
+            self.cam.target[1] -= (-d.x * sy - d.y * cy) * k;
+            if mt.zoom_delta != 1.0 && mt.zoom_delta > 0.0 {
+                self.cam.dist = (self.cam.dist / mt.zoom_delta).clamp(5.0, 20000.0);
+            }
+            self.cam.yaw = (self.cam.yaw - mt.rotation_delta.to_degrees()).rem_euclid(360.0);
+            self.follow = false;
+            return;
+        }
+        if resp.dragged_by(egui::PointerButton::Primary) && !ui.input(|i| i.modifiers.shift) {
+            let d = resp.drag_delta();
+            self.cam.yaw = (self.cam.yaw - d.x * 0.3).rem_euclid(360.0);
+            self.cam.pitch = (self.cam.pitch + d.y * 0.25).clamp(5.0, 89.9);
+        } else if resp.dragged_by(egui::PointerButton::Secondary)
+            || resp.dragged_by(egui::PointerButton::Middle)
+            || (resp.dragged_by(egui::PointerButton::Primary) && ui.input(|i| i.modifiers.shift))
+        {
+            let d = resp.drag_delta();
+            let k = self.cam.dist / 800.0;
+            let (sy, cy) = self.cam.yaw.to_radians().sin_cos();
+            // screen right = (cos yaw, -sin yaw), screen up = (sin yaw, cos yaw) on the ground
+            self.cam.target[0] -= (d.x * cy - d.y * sy) * k;
+            self.cam.target[1] -= (-d.x * sy - d.y * cy) * k;
+            self.follow = false;
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta().y);
+            let zoom = ui.input(|i| i.zoom_delta());
+            if scroll != 0.0 {
+                self.cam.dist = (self.cam.dist * (-scroll * 0.0015).exp()).clamp(5.0, 20000.0);
+            }
+            if zoom != 1.0 {
+                self.cam.dist = (self.cam.dist / zoom).clamp(5.0, 20000.0);
+            }
+        }
+    }
+
+    fn update_particles(&mut self, slice: &FieldSlice, dt: f32) {
+        if self.particle_levels != slice.levels || self.particles.len() != slice.levels.len() {
+            self.particle_levels = slice.levels.clone();
+            self.particles = (0..slice.levels.len()).map(|_| Vec::new()).collect();
+        }
+        let (s, n, w, e) = slice.bbox();
+        let sim_s = (self.flow_hours_per_s * 3600.0 * dt.min(0.1)) as f64;
+        let want = self.particles_per_level;
+        for k in 0..self.particles.len() {
+            let mut ps = std::mem::take(&mut self.particles[k]);
+            ps.truncate(want);
+            while ps.len() < want {
+                let (la, lo) = (s + self.rand() * (n - s), w + self.rand() * (e - w));
+                let max_age = 50 + (self.rand() * 90.0) as u32;
+                let age = (self.rand() * max_age as f64) as u32;
+                ps.push(Particle {
+                    lat: la,
+                    lon: lo,
+                    trail: Vec::new(),
+                    age,
+                    max_age,
+                });
+            }
+            for p in &mut ps {
+                p.age += 1;
+                let wind = slice.wind(k, p.lat, p.lon);
+                let out = p.lat < s || p.lat > n || p.lon < w || p.lon > e;
+                if p.age > p.max_age || wind.is_none() || out {
+                    p.lat = s + self.rand() * (n - s);
+                    p.lon = w + self.rand() * (e - w);
+                    p.trail.clear();
+                    p.age = 0;
+                    continue;
+                }
+                let (u, v) = wind.unwrap_or((0.0, 0.0));
+                p.trail.push((p.lat, p.lon));
+                if p.trail.len() > 14 {
+                    p.trail.remove(0);
+                }
+                p.lat += (v as f64 * sim_s / 1000.0 / EARTH_KM).to_degrees();
+                p.lon += (u as f64 * sim_s / 1000.0 / (EARTH_KM * p.lat.to_radians().cos()))
+                    .to_degrees();
+            }
+            self.particles[k] = ps;
+        }
+    }
+
+    /// Draw the 3D view into `ui`'s available rect.
+    pub fn show(&mut self, ui: &mut Ui, mut scene: Scene) -> Output {
+        let rect = ui.available_rect_before_wrap();
+        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+        let mut out = Output::default();
+        if self.needs_fit || self.origin.is_none() {
+            self.fit(&scene);
+        }
+        if self.origin.is_some()
+            && !self.needs_fit
+            && let Some((cam, exag, auto, origin)) = self.pending_cam.take()
+        {
+            if origin.is_some() {
+                self.origin = origin;
+            }
+            self.cam = Camera {
+                fov_deg: self.cam.fov_deg,
+                ..cam
+            };
+            if let Some(e) = exag {
+                self.exag = e;
+            }
+            if let Some(a) = auto {
+                self.auto_exag = a;
+            }
+        }
+        let Some(origin) = self.origin else {
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "Load tracks to see them in 3D",
+                FontId::proportional(16.0),
+                Color32::GRAY,
+            );
+            return out;
+        };
+        self.controls(ui, &resp);
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(14, 18, 24));
+
+        // Follow the selected animal.
+        if self.follow
+            && let Some(ti) = scene.selected.map(|s| s.0).or(scene.focus_track)
+            && let Some((la, lo, _)) = scene
+                .tracks
+                .get(ti)
+                .and_then(|t| t.position_at(scene.t_now))
+        {
+            let p0 = Proj::new(&self.cam, origin, self.exag, rect);
+            let tgt = p0.enu(la, lo, 0.0);
+            self.cam.target[0] += (tgt[0] - self.cam.target[0]) * 0.15;
+            self.cam.target[1] += (tgt[1] - self.cam.target[1]) * 0.15;
+        }
+        if self.auto_exag
+            && let Some(sl) = scene.slice
+        {
+            let (s, n, w, e) = sl.bbox();
+            let width_km = ((e - w).to_radians() * EARTH_KM * ((s + n) / 2.0).to_radians().cos())
+                .max((n - s).to_radians() * EARTH_KM);
+            let top_km = sl.mean_z.iter().copied().fold(0.3f32, f32::max) / 1000.0;
+            let target = (0.2 * width_km as f32 / top_km).clamp(20.0, 3000.0);
+            // ease towards the target so it doesn't jump when the field changes
+            self.exag += (target - self.exag) * 0.2;
+        }
+        if self.auto_exag && scene.slice.is_none() {
+            // deepest dive ~ 15 % of the view width (at least 1×)
+            let deepest = scene
+                .dives
+                .iter()
+                .map(|d| d.max_depth)
+                .fold(0.0f32, f32::max)
+                .max(20.0);
+            let target = (0.15 * self.cam.dist * 1000.0 / deepest).clamp(1.0, 500.0);
+            self.exag += (target - self.exag) * 0.2;
+        }
+        let pr = Proj::new(&self.cam, origin, self.exag, rect);
+
+        // ---------------------------------------------------------------- ground
+        let view_bbox = {
+            let r = (self.cam.dist * 1.6).max(100.0);
+            let (s, w) = pr.latlon(self.cam.target[0] - r, self.cam.target[1] - r);
+            let (n, e) = pr.latlon(self.cam.target[0] + r, self.cam.target[1] + r);
+            (s.max(-84.0), n.min(84.0), w.max(-179.9), e.min(179.9))
+        };
+        let tint = Color32::from_gray(((1.0 - self.ground_dim) * 255.0) as u8);
+        let terr = self.terrain_src.clone();
+        let mut elev = self.terrain.then(|| terr.sampler(tile_zoom(view_bbox) + 1));
+        if let Some(base) = scene.base.as_deref_mut() {
+            draw_tiles(&painter, &pr, base, view_bbox, tint, &mut elev);
+        }
+        if let Some((sat, op)) = scene.sat.as_mut() {
+            let a = (*op * (1.0 - self.ground_dim * 0.5) * 255.0) as u8;
+            draw_tiles(
+                &painter,
+                &pr,
+                &mut **sat,
+                view_bbox,
+                Color32::from_rgba_premultiplied(a, a, a, a),
+                &mut elev,
+            );
+        }
+
+        // ---------------------------------------------------------------- wind field
+        if let Some(slice) = scene.slice {
+            let dt = ui.input(|i| i.stable_dt);
+            if self.particles_on {
+                self.update_particles(slice, dt);
+                ui.ctx().request_repaint();
+            }
+            let rl = self.raster_level.min(slice.levels.len().saturating_sub(1));
+            if self.show_raster && !slice.levels.is_empty() {
+                let mut mesh = Mesh::default();
+                let nl = slice.nlon;
+                let mut idx = vec![u32::MAX; slice.nlat * nl];
+                for i in 0..slice.nlat {
+                    for j in 0..nl {
+                        let (u, v) = slice.uv[rl][i * nl + j];
+                        if !u.is_finite() {
+                            continue;
+                        }
+                        let (la, lo) = (
+                            slice.lat0 + i as f64 * slice.step_deg,
+                            slice.lon0 + j as f64 * slice.step_deg,
+                        );
+                        if let Some(p) = pr.geo(la, lo, ground(&mut elev, la, lo)) {
+                            idx[i * nl + j] = mesh.vertices.len() as u32;
+                            mesh.colored_vertex(p, wind_color((u * u + v * v).sqrt(), 120));
+                        }
+                    }
+                }
+                for i in 0..slice.nlat.saturating_sub(1) {
+                    for j in 0..nl.saturating_sub(1) {
+                        let (a, b, c, d) = (
+                            idx[i * nl + j],
+                            idx[i * nl + j + 1],
+                            idx[(i + 1) * nl + j],
+                            idx[(i + 1) * nl + j + 1],
+                        );
+                        if a != u32::MAX && b != u32::MAX && c != u32::MAX && d != u32::MAX {
+                            mesh.add_triangle(a, b, d);
+                            mesh.add_triangle(a, d, c);
+                        }
+                    }
+                }
+                painter.add(Shape::mesh(mesh));
+            }
+            let (s, n, w, e) = slice.bbox();
+            // Corner posts from the ground to the top level tie the stack together.
+            if self.show_planes
+                && let Some(&top) = slice.mean_z.iter().max_by(|a, b| a.total_cmp(b))
+            {
+                for (la, lo) in [(s, w), (s, e), (n, e), (n, w)] {
+                    if let (Some(a), Some(b)) = (pr.geo(la, lo, 0.0), pr.geo(la, lo, top)) {
+                        painter
+                            .line_segment([a, b], Stroke::new(1.0, Color32::from_white_alpha(45)));
+                    }
+                }
+            }
+            let mut plane_labels: Vec<(Pos2, String, usize)> = Vec::new();
+            for (k, &h) in slice.mean_z.iter().enumerate() {
+                let focus = k == rl;
+                if self.show_planes {
+                    let corners = [(s, w), (s, e), (n, e), (n, w), (s, w)];
+                    let pts: Vec<Pos2> = corners
+                        .iter()
+                        .filter_map(|&(la, lo)| pr.geo(la, lo, h))
+                        .collect();
+                    if pts.len() == 5 {
+                        // faint tinted fill so each level reads as a sheet
+                        painter.add(Shape::convex_polygon(
+                            pts[..4].to_vec(),
+                            level_color(k, if focus { 22 } else { 12 }),
+                            Stroke::NONE,
+                        ));
+                        painter.add(Shape::line(
+                            pts.clone(),
+                            Stroke::new(
+                                if focus { 2.0 } else { 1.3 },
+                                level_color(k, if focus { 230 } else { 150 }),
+                            ),
+                        ));
+                        let anchor = pts[..4]
+                            .iter()
+                            .copied()
+                            .min_by(|a, b| a.x.total_cmp(&b.x))
+                            .unwrap_or(pts[0]);
+                        let label = match scene.slice_level_hpa.get(k) {
+                            Some(p) => format!("{h:.0} m  ({p:.0} hPa)"),
+                            None => format!("{h:.0} m"),
+                        };
+                        plane_labels.push((anchor + vec2(-6.0, 0.0), label, k));
+                    }
+                }
+                if self.particles_on && k < self.particles.len() {
+                    for p in &self.particles[k] {
+                        if p.trail.len() < 2 {
+                            continue;
+                        }
+                        let sp = slice
+                            .wind(k, p.lat, p.lon)
+                            .map(|(u, v)| (u * u + v * v).sqrt())
+                            .unwrap_or(0.0);
+                        let base_a = (90.0 + sp * 9.0).min(230.0) * if focus { 1.0 } else { 0.6 };
+                        let fade_in = (p.age as f32 / 10.0).min(1.0)
+                            * (1.0 - (p.age as f32 / p.max_age as f32).powi(4));
+                        let pts: Vec<Pos2> = p
+                            .trail
+                            .iter()
+                            .filter_map(|&(la, lo)| pr.geo(la, lo, h))
+                            .collect();
+                        let m = pts.len();
+                        for (q, seg) in pts.windows(2).enumerate() {
+                            let a = (base_a * fade_in * (q + 1) as f32 / m as f32) as u8;
+                            painter.line_segment(
+                                [seg[0], seg[1]],
+                                Stroke::new(if focus { 1.3 } else { 1.0 }, level_color(k, a)),
+                            );
+                        }
+                    }
+                }
+            }
+            // Level labels, nudged apart so close levels don't overprint.
+            plane_labels.sort_by(|a, b| b.0.y.total_cmp(&a.0.y));
+            let mut last_y = f32::INFINITY;
+            for (mut p, label, k) in plane_labels {
+                if p.y > last_y - 16.0 {
+                    p.y = last_y - 16.0;
+                }
+                last_y = p.y;
+                let lr = painter.text(
+                    p,
+                    Align2::RIGHT_CENTER,
+                    label,
+                    FontId::monospace(13.0),
+                    level_color(k, 255),
+                );
+                painter.circle_filled(lr.left_center() - vec2(7.0, 0.0), 4.0, level_color(k, 255));
+            }
+        }
+
+        // ---------------------------------------------------------------- cloud deck
+        // A translucent sheet at the cloud base, opacity from the low cloud cover, at the
+        // same vertical exaggeration as the flight altitudes.
+        if self.show_clouds
+            && let Some((base, low)) = &scene.clouds
+        {
+            let mut mesh = Mesh::default();
+            let mut idx = vec![u32::MAX; base.ni * base.nj];
+            for a in 0..base.ni {
+                for b in 0..base.nj {
+                    let (z, c) = (base.at(a, b), low.at(a, b));
+                    if !z.is_finite() {
+                        continue;
+                    }
+                    let (la, lo) = base.latlon(a as f64, b as f64);
+                    let Some(p) = pr.geo(la, lo, z) else {
+                        continue;
+                    };
+                    let cover = if c.is_finite() { c / 100.0 } else { 0.0 };
+                    let alpha = if cover < 0.1 {
+                        0
+                    } else {
+                        (40.0 + 150.0 * cover) as u8
+                    };
+                    idx[a * base.nj + b] = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(p, Color32::from_rgba_unmultiplied(225, 230, 240, alpha));
+                }
+            }
+            for a in 0..base.ni.saturating_sub(1) {
+                for b in 0..base.nj.saturating_sub(1) {
+                    let q = [
+                        idx[a * base.nj + b],
+                        idx[a * base.nj + b + 1],
+                        idx[(a + 1) * base.nj + b],
+                        idx[(a + 1) * base.nj + b + 1],
+                    ];
+                    if q.iter().all(|&i| i != u32::MAX) {
+                        mesh.add_triangle(q[0], q[1], q[3]);
+                        mesh.add_triangle(q[0], q[3], q[2]);
+                    }
+                }
+            }
+            painter.add(Shape::mesh(mesh));
+        }
+
+        // ---------------------------------------------------------------- structures
+        // Turbines as a mast to the bottom of the rotor plus the rotor-swept height band,
+        // so flight altitudes can be read against it (same vertical exaggeration).
+        if let Some(sd) = &scene.structures {
+            let (s, n, w, e) = view_bbox;
+            let tgt = self.cam.target;
+            let mut vis: Vec<(f32, usize)> = sd
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| {
+                    sd.params.counts(x) && x.lat >= s && x.lat <= n && x.lon >= w && x.lon <= e
+                })
+                .map(|(i, x)| {
+                    let p = pr.enu(x.lat, x.lon, 0.0);
+                    ((p[0] - tgt[0]).powi(2) + (p[1] - tgt[1]).powi(2), i)
+                })
+                .collect();
+            // the nearest few thousand, drawn far to near
+            vis.sort_by(|a, b| a.0.total_cmp(&b.0));
+            vis.truncate(4000);
+            for &(_, i) in vis.iter().rev() {
+                let x = &sd.items[i];
+                let hit = sd.hits.contains(&i);
+                let g = ground(&mut elev, x.lat, x.lon);
+                let (hub, rotor, total, _) = x.dims();
+                let Some(p0) = pr.geo(x.lat, x.lon, g) else {
+                    continue;
+                };
+                let col = if hit {
+                    Color32::from_rgb(255, 140, 30)
+                } else {
+                    Color32::from_gray(225)
+                };
+                if x.kind == crate::structures::Kind::WindTurbine {
+                    let (Some(lo), Some(hi)) = (
+                        pr.geo(x.lat, x.lon, g + hub - rotor / 2.0),
+                        pr.geo(x.lat, x.lon, g + hub + rotor / 2.0),
+                    ) else {
+                        continue;
+                    };
+                    painter.line_segment(
+                        [p0, lo],
+                        Stroke::new(1.0, Color32::from_gray(200).gamma_multiply(0.8)),
+                    );
+                    painter.line_segment([lo, hi], Stroke::new(if hit { 3.0 } else { 2.2 }, col));
+                    if let Some(h) = pr.geo(x.lat, x.lon, g + hub) {
+                        painter.circle_filled(h, if hit { 2.5 } else { 1.6 }, col);
+                    }
+                } else if let Some(top) = pr.geo(x.lat, x.lon, g + total) {
+                    painter.line_segment([p0, top], Stroke::new(1.2, col.gamma_multiply(0.75)));
+                    painter.circle_filled(top, 1.5, col);
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- dives
+        // Each dive as a curtain line from the surface down to its depth profile, far first.
+        {
+            let tgt = self.cam.target;
+            let mut order: Vec<(f32, usize)> = scene
+                .dives
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| {
+                    let (la, lo, _) = *d.pts.first()?;
+                    let p = pr.enu(la, lo, 0.0);
+                    Some(((p[0] - tgt[0]).powi(2) + (p[1] - tgt[1]).powi(2), i))
+                })
+                .collect();
+            order.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for (_, i) in order {
+                let d = &scene.dives[i];
+                let pts: Vec<(Pos2, f32)> = d
+                    .pts
+                    .iter()
+                    .filter_map(|&(la, lo, z)| pr.geo(la, lo, -z).map(|p| (p, z)))
+                    .collect();
+                let a = if d.current {
+                    255
+                } else if d.deep {
+                    210
+                } else {
+                    130
+                };
+                let w = if d.current {
+                    2.6
+                } else if d.deep {
+                    1.6
+                } else {
+                    1.0
+                };
+                for seg in pts.windows(2) {
+                    painter.line_segment(
+                        [seg[0].0, seg[1].0],
+                        Stroke::new(w, depth_color(seg[1].1.max(seg[0].1), a)),
+                    );
+                }
+                if (d.current || d.deep)
+                    && let Some(&(p, z)) = pts.iter().max_by(|a, b| a.1.total_cmp(&b.1))
+                {
+                    painter.circle_filled(
+                        p,
+                        if d.current { 3.5 } else { 2.2 },
+                        depth_color(z, 255),
+                    );
+                    if d.current {
+                        painter.text(
+                            p + vec2(6.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            format!("{z:.0} m"),
+                            FontId::proportional(13.0),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- tracks
+        let mut hits: Vec<(Pos2, usize, usize)> = Vec::new();
+        let mut labels: Vec<(Pos2, Color32, String)> = Vec::new();
+        for (ti, tr) in scene.tracks.iter().enumerate() {
+            if !tr.visible || tr.fixes.is_empty() {
+                continue;
+            }
+            let col = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
+            // Ground under each fix: sea level, or the terrain when it is shown.
+            let gr: Vec<f32> = tr
+                .fixes
+                .iter()
+                .map(|f| ground(&mut elev, f.lat, f.lon))
+                .collect();
+            // swimmers at the sea surface (or on land when hauled out)
+            let alt = |i: usize| gr[i].max(0.0) + self.default_alt_m;
+            let gap = gap_threshold(tr) * self.gap_factor as f64;
+            let keep: Vec<usize> = (0..tr.fixes.len())
+                .filter(|&i| tr.fixes[i].error_m.is_none_or(|e| e <= scene.max_error_m))
+                .collect();
+            let mut prev: Option<(usize, Pos2, Pos2)> = None;
+            for &i in &keep {
+                let f = &tr.fixes[i];
+                let future = scene.trail_to_cursor && f.t as f64 > scene.t_now;
+                let a = alt(i);
+                let (Some(p), Some(g)) = (pr.geo(f.lat, f.lon, a), pr.geo(f.lat, f.lon, gr[i]))
+                else {
+                    prev = None;
+                    continue;
+                };
+                let c = if future {
+                    col.gamma_multiply(0.18)
+                } else {
+                    col
+                };
+                if let Some((pi, pp, pg)) = prev {
+                    let dt = (f.t - tr.fixes[pi].t) as f64;
+                    if self.show_shadows && !future {
+                        painter.line_segment(
+                            [pg, g],
+                            Stroke::new(1.0, Color32::from_black_alpha(110)),
+                        );
+                    }
+                    if dt > gap {
+                        painter.extend(Shape::dashed_line(&[pp, p], Stroke::new(1.6, c), 2.0, 4.0));
+                    } else {
+                        painter.line_segment([pp, p], Stroke::new(2.2, c));
+                    }
+                }
+                // water column from the surface down to the seafloor
+                if self.show_drop_lines && !future && gr[i] < 0.0 {
+                    painter.line_segment([p, g], Stroke::new(0.6, col.gamma_multiply(0.3)));
+                }
+                if !future {
+                    let sel = scene.selected == Some((ti, i));
+                    painter.circle(
+                        p,
+                        if sel { 5.0 } else { 2.3 },
+                        c,
+                        Stroke::new(if sel { 2.0 } else { 0.5 }, Color32::from_black_alpha(160)),
+                    );
+                    hits.push((p, ti, i));
+                }
+                prev = Some((i, p, g));
+            }
+            // current position
+            if let Some((la, lo, idx)) = tr.position_at(scene.t_now) {
+                let a0 = alt(idx);
+                let a1 = if idx + 1 < tr.fixes.len() {
+                    alt(idx + 1)
+                } else {
+                    a0
+                };
+                let span = tr
+                    .fixes
+                    .get(idx + 1)
+                    .map(|b| (b.t - tr.fixes[idx].t) as f64)
+                    .unwrap_or(1.0)
+                    .max(1.0);
+                let w = ((scene.t_now - tr.fixes[idx].t as f64) / span).clamp(0.0, 1.0) as f32;
+                if let Some(p) = pr.geo(la, lo, a0 + (a1 - a0) * w) {
+                    painter.circle(p, 6.5, col, Stroke::new(2.0, Color32::from_gray(20)));
+                    labels.push((p, col, tr.id.clone()));
+                }
+            }
+        }
+        for (p, c, s) in labels {
+            let fid = FontId::proportional(15.0);
+            painter.text(
+                p + vec2(1.0, -9.0),
+                Align2::CENTER_BOTTOM,
+                &s,
+                fid.clone(),
+                Color32::from_black_alpha(200),
+            );
+            painter.text(p + vec2(0.0, -10.0), Align2::CENTER_BOTTOM, &s, fid, c);
+        }
+
+        // ---------------------------------------------------------------- hover / click
+        if let Some(h) = resp.hover_pos()
+            && let Some(&(p, ti, fi)) = hits
+                .iter()
+                .filter(|x| x.0.distance(h) < 9.0)
+                .min_by(|a, b| a.0.distance(h).total_cmp(&b.0.distance(h)))
+        {
+            out.hover = Some((ti, fi, p));
+            if resp.clicked() {
+                out.clicked = Some((ti, fi));
+            }
+        }
+
+        if let Some(el) = elev.take() {
+            terr.finish(el, ui.ctx());
+        }
+
+        // ---------------------------------------------------------------- HUD
+        self.hud(ui, &painter, rect, &scene);
+        out
+    }
+
+    fn hud(&mut self, ui: &mut Ui, painter: &egui::Painter, rect: Rect, scene: &Scene) {
+        let amber = Color32::from_rgb(245, 190, 90);
+        // Phone-width layout: smaller caption, wrapped subtitle, no mouse hints.
+        let compact = rect.width() < 600.0;
+        // big date, like a story caption
+        let t = scene.t_now as i64;
+        let date = chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+            .map(|d| {
+                (
+                    d.format("%b %d").to_string().to_uppercase(),
+                    d.format("%H:%M UTC").to_string(),
+                )
+            })
+            .unwrap_or_default();
+        let r1 = painter.text(
+            rect.left_top() + vec2(18.0, 14.0),
+            Align2::LEFT_TOP,
+            &date.0,
+            FontId::monospace(if compact { 22.0 } else { 30.0 }),
+            amber,
+        );
+        painter.text(
+            r1.right_bottom() + vec2(10.0, -4.0),
+            Align2::LEFT_BOTTOM,
+            &date.1,
+            FontId::monospace(if compact { 13.0 } else { 16.0 }),
+            Color32::from_gray(210),
+        );
+        let fs = if compact { 12.0 } else { 14.0 };
+        let mut y0 = r1.bottom() + 6.0;
+        if let Some(slice) = scene.slice {
+            // "Winds at" + one coloured chip per level (same colours as particles and planes)
+            let mut x = r1.left();
+            let r = painter.text(
+                pos2(x, y0),
+                Align2::LEFT_TOP,
+                "Winds at",
+                FontId::proportional(fs),
+                Color32::from_gray(200),
+            );
+            x = r.right() + 8.0;
+            for (k, h) in slice.mean_z.iter().enumerate() {
+                painter.circle_filled(pos2(x + 4.0, r.center().y), 4.0, level_color(k, 255));
+                let rr = painter.text(
+                    pos2(x + 11.0, y0),
+                    Align2::LEFT_TOP,
+                    format!("{h:.0} m"),
+                    FontId::proportional(fs),
+                    level_color(k, 255),
+                );
+                x = rr.right() + 10.0;
+            }
+            y0 = r.bottom() + 2.0;
+        }
+        let deepest = scene
+            .dives
+            .iter()
+            .map(|d| d.max_depth)
+            .fold(0.0f32, f32::max);
+        let (subtitle, col) = if scene.dives.is_empty() {
+            (
+                "No dives in the window - load depth data, or widen the dive window in 'Dives & bathymetry'."
+                    .to_string(),
+                Color32::from_gray(170),
+            )
+        } else {
+            (
+                format!(
+                    "{} dives, deepest {deepest:.0} m · depth ×{:.0} · bright: deep dives and the dive at the cursor",
+                    scene.dives.len(),
+                    self.exag
+                ),
+                Color32::from_gray(190),
+            )
+        };
+        // wrap so it never runs under the camera buttons on the right
+        let wrap = (rect.width() - 120.0).max(120.0);
+        let galley = painter.layout(subtitle, FontId::proportional(fs), col, wrap);
+        painter.galley(pos2(r1.left(), y0), galley, col);
+
+        // km from where each was tagged
+        let mut x = rect.left() + 18.0;
+        let y = rect.bottom() - if compact { 56.0 } else { 46.0 };
+        painter.text(
+            pos2(x, y - 6.0),
+            Align2::LEFT_BOTTOM,
+            "km from the tagging site",
+            FontId::proportional(12.0),
+            Color32::from_gray(200),
+        );
+        for tr in scene.tracks.iter().filter(|t| t.visible).take(8) {
+            let Some(first) = tr.fixes.first() else {
+                continue;
+            };
+            let Some((la, lo, _)) = tr.position_at(scene.t_now).or_else(|| {
+                if scene.t_now > tr.fixes.last()?.t as f64 {
+                    let l = tr.fixes.last()?;
+                    Some((l.lat, l.lon, 0))
+                } else {
+                    None
+                }
+            }) else {
+                continue;
+            };
+            let km = geo::haversine_m(first.lat, first.lon, la, lo) / 1000.0;
+            let col = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
+            let r = painter.text(
+                pos2(x, y),
+                Align2::LEFT_TOP,
+                &tr.id,
+                FontId::proportional(12.0),
+                col,
+            );
+            let r2 = painter.text(
+                pos2(x, y + 15.0),
+                Align2::LEFT_TOP,
+                format!("{km:.0}"),
+                FontId::proportional(20.0),
+                Color32::WHITE,
+            );
+            x += r.width().max(r2.width()) + 16.0;
+        }
+
+        // legend
+        if self.show_raster
+            && let Some(slice) = scene.slice
+            && let Some(h) = slice
+                .mean_z
+                .get(self.raster_level.min(slice.mean_z.len().saturating_sub(1)))
+        {
+            let w = 150.0;
+            let o = if compact {
+                pos2(rect.right() - w - 40.0, rect.bottom() - 100.0)
+            } else {
+                pos2(rect.right() - w - 40.0, rect.bottom() - 62.0)
+            };
+            painter.text(
+                o - vec2(8.0, -5.0),
+                Align2::RIGHT_CENTER,
+                format!("wind at {h:.0} m"),
+                FontId::proportional(12.0),
+                Color32::from_gray(210),
+            );
+            for i in 0..30 {
+                let s = i as f32 / 29.0 * 28.0;
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        o + vec2(i as f32 * w / 30.0, 0.0),
+                        vec2(w / 30.0 + 0.5, 10.0),
+                    ),
+                    0.0,
+                    wind_color(s, 255),
+                );
+            }
+            painter.text(
+                o + vec2(w + 4.0, 5.0),
+                Align2::LEFT_CENTER,
+                "m/s",
+                FontId::proportional(11.0),
+                Color32::from_gray(200),
+            );
+            painter.text(
+                o + vec2(0.0, 13.0),
+                Align2::LEFT_TOP,
+                "0",
+                FontId::proportional(10.0),
+                Color32::from_gray(200),
+            );
+            painter.text(
+                o + vec2(w, 13.0),
+                Align2::RIGHT_TOP,
+                "28",
+                FontId::proportional(10.0),
+                Color32::from_gray(200),
+            );
+        }
+        painter.text(
+            rect.right_bottom() - vec2(8.0, 6.0),
+            Align2::RIGHT_BOTTOM,
+            format!(
+                "{}{}{}",
+                if scene.source_label.is_empty() {
+                    String::new()
+                } else {
+                    format!("3D winds: {} · ", scene.source_label)
+                },
+                scene.basemap_attribution,
+                if self.terrain {
+                    let n = self.terrain_src.loading();
+                    let busy = if n > 0 {
+                        format!(" (loading {n} tiles)")
+                    } else {
+                        String::new()
+                    };
+                    format!(" · {}{busy}", crate::terrain::ATTRIBUTION)
+                } else {
+                    String::new()
+                }
+            ),
+            FontId::proportional(10.0),
+            Color32::from_gray(170),
+        );
+
+        // camera buttons
+        let mut y = rect.top() + 12.0;
+        for (label, act) in [
+            ("Fit", 0),
+            ("Top", 1),
+            ("Tilt", 2),
+            ("Follow", 3),
+            ("Terrain", 4),
+        ] {
+            let r = Rect::from_min_size(pos2(rect.right() - 74.0, y), vec2(62.0, 22.0));
+            let selected = (act == 3 && self.follow) || (act == 4 && self.terrain);
+            let mut b = ui.put(r, egui::Button::new(label).selected(selected));
+            if act == 4 {
+                b = b.on_hover_text(
+                    "3D topography: drape the map over real terrain (same vertical exaggeration as the flight altitudes)",
+                );
+            }
+            if b.clicked() {
+                match act {
+                    0 => self.needs_fit = true,
+                    1 => self.cam.pitch = 89.9,
+                    2 => self.cam.pitch = 35.0,
+                    3 => self.follow = !self.follow,
+                    _ => self.terrain = !self.terrain,
+                }
+            }
+            y += 26.0;
+        }
+        if !compact {
+            painter.text(
+                pos2(rect.right() - 12.0, y + 4.0),
+                Align2::RIGHT_TOP,
+                "drag: orbit\nshift/right-drag or 2 fingers: pan\nscroll or pinch: zoom",
+                FontId::proportional(10.0),
+                Color32::from_gray(140),
+            );
+        }
+    }
+}
+
+/// Median fix interval of a track (s), at least 1 h.
+fn gap_threshold(tr: &Track) -> f64 {
+    let mut d: Vec<i64> = tr
+        .fixes
+        .windows(2)
+        .map(|w| w[1].t - w[0].t)
+        .filter(|d| *d > 0)
+        .collect();
+    if d.is_empty() {
+        return 3600.0;
+    }
+    d.sort_unstable();
+    (d[d.len() / 2] as f64).max(3600.0)
+}
+
+/// Ground height (m) at a point: the terrain when it is on, else sea level.
+fn ground(elev: &mut Option<crate::terrain::Sampler<'_>>, lat: f64, lon: f64) -> f32 {
+    elev.as_mut().map_or(0.0, |s| s.elev(lat, lon))
+}
+
+/// Web-Mercator zoom for the visible ground: about six tiles across, at most 144 tiles.
+fn tile_zoom(bbox: (f64, f64, f64, f64)) -> u8 {
+    let (s, n, w, e) = bbox;
+    let span = (e - w).max(1e-3);
+    let mut z = ((360.0 / (span / 6.0)).log2().floor() as i32).clamp(2, 12) as u8;
+    loop {
+        let nx = lon_to_tile(e, z).floor() - lon_to_tile(w, z).floor() + 1.0;
+        let ny = lat_to_tile(s, z).floor() - lat_to_tile(n, z).floor() + 1.0;
+        if nx * ny <= 144.0 || z <= 2 {
+            return z;
+        }
+        z -= 1;
+    }
+}
+
+/// Lambert hill-shading factor for a surface normal, 1.0 on flat ground (light from the NW).
+fn hillshade(n: [f32; 3]) -> f32 {
+    let l = norm([-1.0, 1.0, 1.4]);
+    let flat = 0.35 + 0.65 * l[2];
+    ((0.35 + 0.65 * dot(n, l).max(0.0)) / flat).clamp(0.3, 1.35)
+}
+
+/// Scale a (premultiplied) vertex colour by a shade factor without breaking premultiplication.
+fn shade(c: Color32, k: f32) -> Color32 {
+    let cap = c.a() as f32;
+    let f = |v: u8| ((v as f32 * k).min(cap)) as u8;
+    Color32::from_rgba_premultiplied(f(c.r()), f(c.g()), f(c.b()), c.a())
+}
+
+/// A tile-shaped grid of ground vertices: world positions (with terrain heights when `elev`
+/// is set), hill-shade factors, and the cells in far-to-near order for painter's-algorithm
+/// drawing (there is no depth buffer).
+struct GroundGrid {
+    pos: Vec<Option<Pos2>>,
+    shade: Vec<f32>,
+    cells: Vec<(usize, usize)>,
+    depth: f32,
+}
+
+fn ground_grid(
+    pr: &Proj,
+    res: usize,
+    corner: impl Fn(f64, f64) -> (f64, f64),
+    elev: &mut Option<crate::terrain::Sampler<'_>>,
+) -> GroundGrid {
+    let n = res + 1;
+    let mut w = Vec::with_capacity(n * n);
+    for a in 0..n {
+        for b in 0..n {
+            let (la, lo) = corner(b as f64 / res as f64, a as f64 / res as f64);
+            w.push(pr.enu(la, lo, ground(elev, la, lo)));
+        }
+    }
+    let mut shade = vec![1.0; n * n];
+    if elev.is_some() {
+        for a in 0..n {
+            for b in 0..n {
+                let (b0, b1) = (b.saturating_sub(1), (b + 1).min(res));
+                let (a0, a1) = (a.saturating_sub(1), (a + 1).min(res));
+                let dx = sub(w[a * n + b1], w[a * n + b0]);
+                let dy = sub(w[a0 * n + b], w[a1 * n + b]); // rows run north → south
+                let mut nv = norm(cross(dx, dy));
+                if nv[2] < 0.0 {
+                    nv = [-nv[0], -nv[1], -nv[2]];
+                }
+                shade[a * n + b] = hillshade(nv);
+            }
+        }
+    }
+    let pos: Vec<Option<Pos2>> = w.iter().map(|&p| pr.project(p)).collect();
+    let dist = |p: [f32; 3]| dot(sub(p, pr.eye), pr.f);
+    let mut cells: Vec<(usize, usize, f32)> = (0..res)
+        .flat_map(|a| (0..res).map(move |b| (a, b)))
+        .map(|(a, b)| {
+            let c = w[a * n + b];
+            let d = w[(a + 1) * n + b + 1];
+            (
+                a,
+                b,
+                dist([
+                    (c[0] + d[0]) / 2.0,
+                    (c[1] + d[1]) / 2.0,
+                    (c[2] + d[2]) / 2.0,
+                ]),
+            )
+        })
+        .collect();
+    cells.sort_by(|x, y| y.2.total_cmp(&x.2));
+    let depth = cells.first().map_or(0.0, |c| c.2);
+    GroundGrid {
+        pos,
+        shade,
+        cells: cells.into_iter().map(|(a, b, _)| (a, b)).collect(),
+        depth,
+    }
+}
+
+/// Emit a grid's cells as triangles (far first) into `mesh`, whose vertices follow the grid.
+fn add_grid_triangles(mesh: &mut Mesh, g: &GroundGrid, res: usize) {
+    let n = res + 1;
+    for &(a, b) in &g.cells {
+        let i = a * n + b;
+        let (i1, i2, i3) = (i + 1, i + n, i + n + 1);
+        if [i, i1, i2, i3].iter().all(|&k| g.pos[k].is_some()) {
+            let (i, i1, i2, i3) = (i as u32, i1 as u32, i2 as u32, i3 as u32);
+            mesh.add_triangle(i, i1, i3);
+            mesh.add_triangle(i, i3, i2);
+        }
+    }
+}
+
+fn draw_tiles(
+    painter: &egui::Painter,
+    pr: &Proj,
+    tiles: &mut dyn Tiles,
+    bbox: (f64, f64, f64, f64),
+    tint: Color32,
+    elev: &mut Option<crate::terrain::Sampler<'_>>,
+) {
+    let (s, n, w, e) = bbox;
+    let z = tile_zoom(bbox);
+    let max = (1u32 << z) - 1;
+    let (x0, x1) = (
+        lon_to_tile(w, z).floor() as u32,
+        (lon_to_tile(e, z).floor() as u32).min(max),
+    );
+    let (y0, y1) = (
+        lat_to_tile(n, z).floor() as u32,
+        (lat_to_tile(s, z).floor() as u32).min(max),
+    );
+    // finer grid when the ground has relief
+    let sub: usize = if elev.is_some() { 16 } else { 6 };
+    let mut meshes: Vec<(f32, Mesh)> = Vec::new();
+    for ty in y0..=y1 {
+        for tx in x0..=x1 {
+            let Some(piece) = tiles.at(TileId {
+                x: tx,
+                y: ty,
+                zoom: z,
+            }) else {
+                continue;
+            };
+            #[allow(irrefutable_let_patterns)]
+            let Tile::Raster(tex) = &piece.tile else {
+                continue;
+            };
+            let g = ground_grid(
+                pr,
+                sub,
+                |fx, fy| (tile_lat(ty as f64 + fy, z), tile_lon(tx as f64 + fx, z)),
+                elev,
+            );
+            let mut mesh = Mesh::with_texture(tex.id());
+            for a in 0..=sub {
+                for b in 0..=sub {
+                    let (fx, fy) = (b as f32 / sub as f32, a as f32 / sub as f32);
+                    let k = a * (sub + 1) + b;
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: g.pos[k].unwrap_or(Pos2::ZERO),
+                        uv: piece.uv.min + vec2(piece.uv.width() * fx, piece.uv.height() * fy),
+                        color: shade(tint, g.shade[k]),
+                    });
+                }
+            }
+            add_grid_triangles(&mut mesh, &g, sub);
+            meshes.push((g.depth, mesh));
+        }
+    }
+    // far tiles first, so nearer relief paints over them
+    meshes.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (_, m) in meshes {
+        painter.add(Shape::mesh(m));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Render the draped ground of a synthetic mountain to JSON (screen polygons + shade),
+    /// for eyeballing relief, hill-shading and far-to-near order:
+    /// `WT_DUMP=out.json cargo test terrain_render_dump -- --ignored`.
+    #[test]
+    #[ignore]
+    fn terrain_render_dump() {
+        use crate::terrain::{SIZE, Terrain, tile_xy};
+        let t = Terrain::default();
+        let z = 7u8;
+        let (cx, cy) = tile_xy(46.5, 8.0, z);
+        for dx in -2i32..=2 {
+            for dy in -2i32..=2 {
+                let (tx, ty) = ((cx as i32 + dx) as u32, (cy as i32 + dy) as u32);
+                let g: Vec<f32> = (0..SIZE * SIZE)
+                    .map(|k| {
+                        let x = tx as f64 + (k % SIZE) as f64 / SIZE as f64 - cx;
+                        let y = ty as f64 + (k / SIZE) as f64 / SIZE as f64 - cy;
+                        let r2 = x * x + y * y;
+                        (3500.0 * (-r2 / 0.6).exp()
+                            + 900.0 * (-((x - 1.2).powi(2) + (y + 0.8).powi(2)) / 0.15).exp())
+                            as f32
+                    })
+                    .collect();
+                t.insert((z, tx, ty), g);
+            }
+        }
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0));
+        let cam = Camera {
+            yaw: 20.0,
+            pitch: 28.0,
+            dist: 900.0,
+            target: [0.0, 0.0, 0.0],
+            ..Camera::default()
+        };
+        let pr = Proj::new(&cam, (46.5, 8.0), 60.0, rect);
+        let mut elev = Some(t.sampler(z));
+        let sub = 16;
+        let mut out = Vec::new();
+        for tyy in (cy as u32 - 2)..=(cy as u32 + 2) {
+            for txx in (cx as u32 - 2)..=(cx as u32 + 2) {
+                let g = ground_grid(
+                    &pr,
+                    sub,
+                    |fx, fy| (tile_lat(tyy as f64 + fy, z), tile_lon(txx as f64 + fx, z)),
+                    &mut elev,
+                );
+                let n = sub + 1;
+                for &(a, b) in &g.cells {
+                    let ks = [
+                        a * n + b,
+                        a * n + b + 1,
+                        (a + 1) * n + b + 1,
+                        (a + 1) * n + b,
+                    ];
+                    if ks.iter().all(|&k| g.pos[k].is_some()) {
+                        let pts: Vec<[f32; 2]> = ks
+                            .iter()
+                            .map(|&k| {
+                                let p = g.pos[k].unwrap();
+                                [p.x, p.y]
+                            })
+                            .collect();
+                        out.push(format!(
+                            "{{\"d\":{},\"s\":{},\"p\":{:?}}}",
+                            g.depth, g.shade[ks[0]], pts
+                        ));
+                    }
+                }
+            }
+        }
+        let path = std::env::var("WT_DUMP").unwrap_or("terrain.json".into());
+        std::fs::write(path, format!("[{}]", out.join(","))).unwrap();
+    }
+
+    #[test]
+    fn projection_basics() {
+        let cam = Camera {
+            yaw: 0.0,
+            pitch: 89.9,
+            dist: 100.0,
+            target: [0.0; 3],
+            fov_deg: 45.0,
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let pr = Proj::new(&cam, (47.0, 9.0), 100.0, rect);
+        let c = pr.geo(47.0, 9.0, 0.0).unwrap();
+        assert!((c.x - 400.0).abs() < 1.0 && (c.y - 300.0).abs() < 1.0);
+        // north is up, east is right when looking straight down with yaw 0
+        let n = pr.geo(47.1, 9.0, 0.0).unwrap();
+        let e = pr.geo(47.0, 9.1, 0.0).unwrap();
+        assert!(n.y < c.y && e.x > c.x);
+        // higher points come closer to the camera → further from centre
+        let up = pr.geo(47.1, 9.0, 500.0).unwrap();
+        assert!(up.y < n.y);
+        let (la, lo) = pr.latlon(10.0, -5.0);
+        let back = pr.enu(la, lo, 0.0);
+        assert!((back[0] - 10.0).abs() < 1e-3 && (back[1] + 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn tiles_math() {
+        assert!((tile_lat(lat_to_tile(47.5, 6), 6) - 47.5).abs() < 1e-9);
+        assert!((tile_lon(lon_to_tile(9.25, 6), 6) - 9.25).abs() < 1e-9);
+        assert_eq!(wind_color(0.0, 255), Color32::from_rgb(30, 60, 90));
+    }
+}
