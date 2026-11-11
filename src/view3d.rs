@@ -1203,7 +1203,7 @@ impl View3D {
             let mut b = ui.put(r, egui::Button::new(label).selected(selected));
             if act == 4 {
                 b = b.on_hover_text(
-                    "3D topography: drape the map over real terrain (same vertical exaggeration as the flight altitudes)",
+                    "Seafloor and land relief: drape the map over the bathymetry / terrain (same vertical exaggeration as the dives)",
                 );
             }
             if b.clicked() {
@@ -1216,6 +1216,42 @@ impl View3D {
                 }
             }
             y += 26.0;
+        }
+        // depth exaggeration: vertical slider under the buttons (auto toggles off when dragged)
+        {
+            let r = Rect::from_min_size(pos2(rect.right() - 74.0, y + 2.0), vec2(62.0, 22.0));
+            let b = ui
+                .put(r, egui::Button::new("Auto ×").selected(self.auto_exag))
+                .on_hover_text(
+                    "Automatic vertical exaggeration: the deepest dive ~15 % of the view width",
+                );
+            if b.clicked() {
+                self.auto_exag = !self.auto_exag;
+            }
+            y += 28.0;
+            let h = 150.0;
+            let sr = Rect::from_min_size(pos2(rect.right() - 58.0, y), vec2(30.0, h));
+            let mut ex = self.exag;
+            let resp = ui.put(
+                sr,
+                egui::Slider::new(&mut ex, 1.0..=1000.0)
+                    .logarithmic(true)
+                    .vertical()
+                    .show_value(false),
+            );
+            if resp.changed() {
+                self.exag = ex;
+                self.auto_exag = false;
+            }
+            resp.on_hover_text("Vertical exaggeration of depths and the seafloor");
+            painter.text(
+                pos2(rect.right() - 43.0, y + h + 4.0),
+                Align2::CENTER_TOP,
+                format!("depth ×{:.0}", self.exag),
+                FontId::proportional(11.0),
+                Color32::from_gray(210),
+            );
+            y += h + 22.0;
         }
         if !compact {
             painter.text(

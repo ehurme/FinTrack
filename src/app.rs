@@ -70,6 +70,12 @@ enum Msg {
         name: String,
         bytes: Vec<u8>,
     },
+    /// An ERA5 wind-cube file picked by the user.
+    /// An ERA5 wind-cube file picked by the user.
+    Cube {
+        name: String,
+        bytes: Vec<u8>,
+    },
     /// An Open-Meteo Marine response.
     Marine {
         req: crate::marine::Request,
@@ -815,6 +821,14 @@ pub struct FinApp {
     marine_inflight: usize,
     marine_pause_until: f64,
     marine_failed: usize,
+    /// Ocean map layer around the animals (Open-Meteo Marine lattice).
+    mf_var: crate::marine::FieldVar,
+    mf_arrows: bool,
+    mf_margin_deg: f32,
+    /// Lattice spacing in 0.1° cells.
+    mf_stride: i32,
+    mf_opacity: f32,
+    mf_days: HashSet<(i64, u64)>,
 
     // weather
     store: WeatherStore,
@@ -1028,6 +1042,12 @@ impl FinApp {
             marine_inflight: 0,
             marine_pause_until: 0.0,
             marine_failed: 0,
+            mf_var: crate::marine::FieldVar::Off,
+            mf_arrows: false,
+            mf_margin_deg: 2.0,
+            mf_stride: 3,
+            mf_opacity: 0.6,
+            mf_days: HashSet::new(),
             store: WeatherStore::default(),
             opts: AnnotateOptions::default(),
             queue: VecDeque::new(),
@@ -1568,6 +1588,9 @@ impl FinApp {
             ),
         );
         m.set("oc", self.ocean_share());
+        if let Some(v) = self.ocean_layer_share() {
+            m.set("ol", v);
+        }
         let mvs = self.mv_share();
         let mv_default = FinApp::mv_default_share();
         m.set_if(mvs != mv_default, "mv", mvs);
@@ -1637,6 +1660,7 @@ impl FinApp {
         self.mv_ui = Default::default();
         self.mv_apply(&m.nums("mv"));
         self.ocean_apply(&m.nums("oc"));
+        self.ocean_layer_apply(m.get("ol"));
         let stv = m.nums("st");
         self.st_on = m.get("st").is_some();
         if let [radius, other, minh, hl, ..] = stv[..] {
@@ -4406,6 +4430,274 @@ impl FinApp {
     }
 
     /// Same for the 2D (surface ERA5) wind field, once the user has annotated at least once.
+    /// Distinct 3D field nodes needed for the week from the cursor day.
+    fn field_node_count(&self) -> usize {
+        let day = weather::day_of(self.t_now as i64);
+        let pts = weather::window_points(
+            &self.tracks,
+            day,
+            7,
+            self.field_radius_deg as f64,
+            self.profiles.node_step,
+        );
+        let mut cells: Vec<weather::CellKey> =
+            pts.iter().map(|p| weather::cell_of(p.0, p.1)).collect();
+        cells.sort_unstable();
+        cells.dedup();
+        cells.len()
+    }
+
+    fn open_cube_dialog(&self, ctx: &egui::Context) {
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("ERA5 wind cube", &["csv", "gz", "txt"])
+                .pick_file()
+            {
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match std::fs::read(&p) {
+                    Ok(bytes) => {
+                        let _ = tx.send(Msg::Cube { name, bytes });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Status(format!("! {}: {e}", p.display())));
+                    }
+                }
+                ctx.request_repaint();
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(f) = rfd::AsyncFileDialog::new()
+                .add_filter("ERA5 wind cube", &["csv", "gz", "txt"])
+                .pick_file()
+                .await
+            {
+                let bytes = f.read().await;
+                let _ = tx.send(Msg::Cube {
+                    name: f.file_name(),
+                    bytes,
+                });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn wind3d_panel(&mut self, ui: &mut Ui) {
+        let is_file = matches!(
+            self.profiles.source,
+            wind3d::Source::File(_) | wind3d::Source::Synthetic
+        );
+        ui.weak(format!("source: {}", self.profiles.source.label()));
+        if !self.profiles.levels.is_empty() {
+            ui.weak(format!(
+                "{} levels {:.0}–{:.0} hPa · {} cells · {} hours",
+                self.profiles.levels.len(),
+                self.profiles.levels.first().copied().unwrap_or(0.0),
+                self.profiles.levels.last().copied().unwrap_or(0.0),
+                self.profiles.cells.len(),
+                self.profiles.hours()
+            ));
+        }
+        let old_model = self.om_model;
+        egui::ComboBox::from_label("Open-Meteo model")
+            .selected_text(self.om_model.label())
+            .show_ui(ui, |ui| {
+                for m in OmModel::ALL {
+                    ui.selectable_value(&mut self.om_model, m, m.label());
+                }
+            });
+        if old_model != self.om_model && !is_file && !self.profiles.is_empty() {
+            self.profiles.use_open_meteo(self.om_model);
+            self.field_days_requested.clear();
+            self.reset_display_levels();
+        }
+        let busy = !self.queue.is_empty() || !self.in_flight.is_empty();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!self.tracks.is_empty() && !busy, egui::Button::new("Download along tracks"))
+                .on_hover_text("Pressure-level wind at every fix and every 3 h along each step; annotates flight-level and best-level wind support")
+                .clicked()
+            {
+                self.start_profiles();
+            }
+            if ui
+                .button("Import ERA5 cube…")
+                .on_hover_text("CSV / CSV.gz from tools/era5_wind_cube.py (any pressure levels, e.g. 1000–500 hPa)")
+                .clicked()
+            {
+                self.open_cube_dialog(ui.ctx());
+            }
+            if is_file && ui.button("Back to Open-Meteo").clicked() {
+                self.profiles.clear();
+                self.field_days_requested.clear();
+                self.ensure_open_meteo();
+                self.reset_display_levels();
+            }
+        });
+        ui.add_enabled_ui(!is_file, |ui| {
+            ui.checkbox(
+                &mut self.field_auto,
+                "auto-download the wind field around the animals (3D tab)",
+            )
+            .on_hover_text(
+                "Fetched a week at a time from the cursor day, as you move through time",
+            );
+            let old_r = self.field_radius_deg;
+            ui.add(
+                egui::Slider::new(&mut self.field_radius_deg, 1.0..=10.0)
+                    .step_by(0.5)
+                    .suffix("°")
+                    .text("field radius around animals"),
+            );
+            if old_r != self.field_radius_deg {
+                self.field_days_requested.clear();
+                self.slice_cache = None;
+            }
+            let old = self.field_step_cells;
+            egui::ComboBox::from_label("field resolution")
+                .selected_text(format!(
+                    "{:.2}°",
+                    self.field_step_cells as f64 * weather::GRID
+                ))
+                .show_ui(ui, |ui| {
+                    for st in [1, 2, 4, 8] {
+                        ui.selectable_value(
+                            &mut self.field_step_cells,
+                            st,
+                            format!("{:.2}°", st as f64 * weather::GRID),
+                        );
+                    }
+                });
+            if old != self.field_step_cells {
+                self.profiles.node_step = self.field_step_cells;
+                self.field_days_requested.clear();
+                self.slice_cache = None;
+            }
+            let n = self.field_node_count();
+            if n > 0 {
+                let txt = format!(
+                    "≈ {n} field points this week (≈ {:.0} API calls)",
+                    n as f32 * 2.5
+                );
+                if n > 1000 {
+                    ui.colored_label(
+                        Color32::from_rgb(240, 160, 60),
+                        txt + " - consider a coarser resolution",
+                    );
+                } else {
+                    ui.weak(txt);
+                }
+            }
+        });
+        if !self.profiles.levels.is_empty() {
+            ui.label("levels shown in 3D:");
+            let mean_z: HashMap<usize, f32> = self
+                .slice_cache
+                .as_ref()
+                .and_then(|c| c.1.as_ref())
+                .map(|sl| {
+                    sl.levels
+                        .iter()
+                        .copied()
+                        .zip(sl.mean_z.iter().copied())
+                        .collect()
+                })
+                .unwrap_or_default();
+            ui.horizontal_wrapped(|ui| {
+                for i in 0..self.profiles.levels.len() {
+                    let p = self.profiles.levels[i];
+                    let h = mean_z
+                        .get(&i)
+                        .copied()
+                        .unwrap_or(geo::pressure_to_altitude_m(p as f64, 1013.25) as f32);
+                    let mut on = self.display_levels.contains(&i);
+                    if ui
+                        .checkbox(&mut on, format!("{p:.0} (~{h:.0} m)"))
+                        .changed()
+                    {
+                        if on && self.display_levels.len() < 5 {
+                            self.display_levels.push(i);
+                        } else {
+                            self.display_levels.retain(|&x| x != i);
+                        }
+                        self.display_levels.sort_unstable();
+                        self.slice_cache = None;
+                    }
+                }
+            });
+            if !self.display_levels.is_empty() {
+                let cur = self.view3d.raster_level.min(self.display_levels.len() - 1);
+                egui::ComboBox::from_label("colour field = wind at")
+                    .selected_text(format!(
+                        "{:.0} hPa",
+                        self.profiles.levels[self.display_levels[cur]]
+                    ))
+                    .show_ui(ui, |ui| {
+                        for (k, &li) in self.display_levels.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.view3d.raster_level,
+                                k,
+                                format!("{:.0} hPa", self.profiles.levels[li]),
+                            );
+                        }
+                    });
+            }
+        }
+        ui.separator();
+        let v = &mut self.view3d;
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut v.auto_exag, "auto").on_hover_text(
+                "Spread the levels so the stack is ~20 % as tall as the wind field is wide",
+            );
+            ui.add_enabled(
+                !v.auto_exag,
+                egui::Slider::new(&mut v.exag, 10.0..=3000.0)
+                    .logarithmic(true)
+                    .text("vertical exaggeration"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut v.particles_on, "flowing particles");
+            ui.checkbox(&mut v.show_raster, "speed colours");
+            ui.checkbox(&mut v.show_planes, "level planes");
+        });
+        if v.particles_on {
+            ui.add(
+                egui::Slider::new(&mut v.particles_per_level, 100..=2500).text("particles / level"),
+            );
+            ui.add(
+                egui::Slider::new(&mut v.flow_hours_per_s, 0.5..=12.0)
+                    .text("flow speed (h of wind / s)"),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut v.show_drop_lines, "drop lines");
+            ui.checkbox(&mut v.show_shadows, "ground shadows");
+            ui.checkbox(&mut v.show_clouds, "cloud base").on_hover_text(
+                "Translucent cloud deck at the cloud base (lifting condensation level from ERA5 2 m temperature and dew point), \
+                 shaded by low cloud cover - compare with the flight altitude",
+            );
+        });
+        ui.toggle_value(&mut v.terrain, "⛰ 3D terrain").on_hover_text(
+            "Drape the basemap over real topography (AWS Terrain Tiles), hill-shaded. Uses the same \
+             vertical exaggeration as the flight altitudes, so heights above ground stay true.",
+        );
+        ui.add(egui::Slider::new(&mut v.ground_dim, 0.0..=0.9).text("dim basemap"));
+        ui.add(
+            egui::Slider::new(&mut v.default_alt_m, 0.0..=2000.0).text("altitude if unknown (m)"),
+        );
+        ui.add(
+            egui::Slider::new(&mut v.gap_factor, 1.5..=8.0)
+                .text("dotted if gap > × median interval"),
+        );
+    }
+
     fn maybe_request_surface_field(&mut self) {
         let layers = self.wx_field != crate::wxfield::FieldVar::Off
             || self.wx_isobars
@@ -4626,6 +4918,16 @@ impl FinApp {
                     }
                 }
                 Msg::Status(s) => self.status(s),
+                Msg::Cube { name, bytes } => match self.profiles.import_cube(&name, &bytes) {
+                    Ok(msg) => {
+                        self.status(format!("Imported wind cube {msg}"));
+                        self.field_days_requested.clear();
+                        self.reset_display_levels();
+                        let n = wind3d::annotate(&mut self.tracks, &self.profiles);
+                        self.status(format!("3D wind (file): annotated {n} fixes"));
+                    }
+                    Err(e) => self.status(format!("! wind cube: {e}")),
+                },
                 Msg::Weather { id, result } => {
                     let Some(job) = self.in_flight.remove(&id) else {
                         continue;
@@ -5504,6 +5806,9 @@ impl FinApp {
                     self.wx_fields_ui(ui);
                     ui.weak("SST, chlorophyll, precipitation imagery: 'Ocean & satellite imagery' in the top bar.");
                 });
+                egui::CollapsingHeader::new("3D wind (pressure levels, for seabirds)").default_open(false).show(ui, |ui| {
+                    self.wind3d_panel(ui);
+                });
                 egui::CollapsingHeader::new("Tropical cyclones").default_open(false).show(ui, |ui| {
                     self.cyclones_ui(ui);
                 });
@@ -5519,6 +5824,11 @@ impl FinApp {
             // ---- dives & ocean
             egui::CollapsingHeader::new("Dives, bathymetry & ocean").default_open(true).show(ui, |ui| {
                 self.ocean_panel(ui);
+            });
+
+            // ---- 3D view
+            egui::CollapsingHeader::new("3D view").default_open(false).show(ui, |ui| {
+                self.view3d_ui(ui);
             });
 
             // ---- movement analysis
@@ -6020,6 +6330,8 @@ impl FinApp {
         }
 
         let home_ranges = self.home_range_draw();
+        let ocean_draw = self.ocean_draw();
+        let ocean_legend = ocean_draw.as_ref().and_then(|o| o.legend());
         let dive_markers = self.dive_markers();
         let swatches = self.legend_swatches();
         let basemap = self.basemap;
@@ -6083,6 +6395,7 @@ impl FinApp {
                 self.wx_isobars,
                 self.wx_centres,
             ),
+            ocean: ocean_draw,
             storms: (self.storms_on && !self.storms.is_empty()).then_some(&self.storms[..]),
             home_ranges,
             dives: dive_markers,
@@ -6170,7 +6483,15 @@ impl FinApp {
                 FontId::proportional(14.0),
                 Color32::WHITE,
             );
-            legend(p, r, color_by, wind_legend, &swatches, wx_field);
+            legend(
+                p,
+                r,
+                color_by,
+                wind_legend,
+                &swatches,
+                wx_field,
+                &ocean_legend,
+            );
             (centre.y(), centre.x())
         });
         self.map_center = Some(shown.inner);
@@ -6874,7 +7195,10 @@ impl eframe::App for FinApp {
                     self.maybe_request_surface_field();
                 }
             }
-            ViewTab::Map => self.maybe_request_surface_field(),
+            ViewTab::Map => {
+                self.maybe_request_surface_field();
+                self.maybe_request_marine_field();
+            }
         }
         self.pump_weather(ctx);
         self.pump_cds(ctx);
@@ -7047,6 +7371,8 @@ struct TrackLayer<'a> {
     structs: Option<StructLayer<'a>>,
     /// ERA5 colour field, isobars and pressure centres at the cursor hour.
     wx: Option<WxDraw>,
+    /// Ocean colour field / current arrows around the animals at the cursor hour.
+    ocean: Option<ocean_ui::OceanDraw>,
     storms: Option<&'a [crate::cyclones::Storm]>,
     /// Dive markers: (lat, lon, max depth m, duration min, deep).
     dives: Vec<(f64, f64, f32, f32, bool)>,
@@ -7233,6 +7559,9 @@ impl Plugin for TrackLayer<'_> {
         let mut best: Option<(f32, usize, usize, Pos2)> = None;
 
         // ERA5 weather layers: colour field, isobars, lows / highs.
+        if let Some(o) = &self.ocean {
+            o.paint(&painter, &to_screen);
+        }
         if let Some(wx) = &self.wx {
             if let Some(g) = &wx.field {
                 let mut mesh = egui::Mesh::default();
@@ -7755,8 +8084,13 @@ fn legend(
     wind: Option<WindPalette>,
     swatches: &Option<(&str, Vec<(String, Color32)>)>,
     field: crate::wxfield::FieldVar,
+    ocean: &Option<ocean_ui::OceanLegend>,
 ) {
     let mut origin = pos2(r.left() + 12.0, r.bottom() - 40.0);
+    if let Some(o) = ocean {
+        colorbar(p, origin, o.title, &o.lo, &o.hi, &|x| o.color(x));
+        origin.y -= 60.0;
+    }
     if field != crate::wxfield::FieldVar::Off {
         let (title, lo, hi) = field.legend();
         colorbar(p, origin, title, lo, hi, &|x| {
