@@ -16,6 +16,152 @@ pub(super) const DIVE_WINDOWS_H: [(f32, &str); 5] = [
 ];
 
 impl FinApp {
+    /// The ocean layer for the cursor hour, if one is on.
+    pub(super) fn ocean_draw(&self) -> Option<OceanDraw> {
+        if self.mf_var == marine::FieldVar::Off && !self.mf_arrows {
+            return None;
+        }
+        let field = marine::field(&self.marine, self.t_now as i64, self.mf_stride, self.mf_var)?;
+        let range = (self.mf_var != marine::FieldVar::Off)
+            .then(|| field.range())
+            .flatten();
+        Some(OceanDraw {
+            var: self.mf_var,
+            field,
+            range,
+            arrows: self.mf_arrows,
+            alpha: (self.mf_opacity * 255.0) as u8,
+        })
+    }
+
+    /// Download the ocean lattice around the animals for the week from the cursor day, once.
+    pub(super) fn maybe_request_marine_field(&mut self) {
+        if (self.mf_var == marine::FieldVar::Off && !self.mf_arrows)
+            || self.tracks.is_empty()
+            || self.marine_queue.len() > 20
+        {
+            return;
+        }
+        let Some(day) = self.next_window_day(&self.mf_days) else {
+            return;
+        };
+        let key = self.visible_key()
+            ^ (self.mf_stride as u64) << 56
+            ^ self.mf_margin_deg.to_bits() as u64;
+        for d in day..day + 7 {
+            self.mf_days.insert((d, key));
+        }
+        // next_window_day keys on visible_key alone; also remember that one
+        let vk = self.visible_key();
+        if key != vk {
+            for d in day..day + 7 {
+                self.mf_days.insert((d, vk));
+            }
+        }
+        let pts = marine::window_points(
+            &self.tracks,
+            day,
+            7,
+            self.mf_margin_deg as f64,
+            self.mf_stride,
+        );
+        let latest = chrono::Utc::now().timestamp().div_euclid(86400);
+        let reqs = self.marine.plan(&pts, latest);
+        if !reqs.is_empty() {
+            self.status(format!(
+                "Ocean layer around the animals, {} – {}: {} request(s) to Open-Meteo Marine",
+                crate::weather::day_str(day),
+                crate::weather::day_str(day + 6),
+                reqs.len()
+            ));
+            self.marine_queue.extend(reqs.into_iter().map(|r| (r, 0)));
+        }
+    }
+
+    /// Ocean map layer controls (part of the ocean panel).
+    fn ocean_layer_ui(&mut self, ui: &mut Ui) {
+        ui.strong("Ocean map layers around the animals");
+        let before = (
+            self.mf_var,
+            self.mf_arrows,
+            self.mf_margin_deg,
+            self.mf_stride,
+        );
+        egui::ComboBox::from_id_salt("mf_var")
+            .selected_text(self.mf_var.label())
+            .show_ui(ui, |ui| {
+                for v in marine::FieldVar::ALL {
+                    ui.selectable_value(&mut self.mf_var, v, v.label());
+                }
+            });
+        ui.checkbox(&mut self.mf_arrows, "surface current arrows");
+        ui.horizontal(|ui| {
+            ui.label("radius");
+            ui.add(
+                egui::DragValue::new(&mut self.mf_margin_deg)
+                    .range(0.3..=10.0)
+                    .speed(0.05)
+                    .suffix("°"),
+            );
+            ui.label("spacing");
+            egui::ComboBox::from_id_salt("mf_stride")
+                .selected_text(format!("{:.1}°", self.mf_stride as f64 * marine::GRID))
+                .show_ui(ui, |ui| {
+                    for st in [1, 2, 3, 5, 10] {
+                        ui.selectable_value(
+                            &mut self.mf_stride,
+                            st,
+                            format!("{:.1}°", st as f64 * marine::GRID),
+                        );
+                    }
+                });
+        });
+        ui.add(egui::Slider::new(&mut self.mf_opacity, 0.1..=1.0).text("opacity"));
+        if before
+            != (
+                self.mf_var,
+                self.mf_arrows,
+                self.mf_margin_deg,
+                self.mf_stride,
+            )
+        {
+            self.mf_days.clear();
+        }
+        ui.weak(
+            "Hourly Open-Meteo Marine values on a lattice around each animal, downloaded a week at a \
+             time from the cursor day (SST, currents and sea level from 2022). Chlorophyll-a and \
+             satellite SST: 'Ocean & satellite imagery' in the top bar.",
+        );
+    }
+
+    /// 3D view options.
+    pub(super) fn view3d_ui(&mut self, ui: &mut Ui) {
+        let v = &mut self.view3d;
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut v.auto_exag, "auto")
+                .on_hover_text("The deepest dive ~15 % of the view width");
+            ui.add_enabled(
+                !v.auto_exag,
+                egui::Slider::new(&mut v.exag, 1.0..=1000.0)
+                    .logarithmic(true)
+                    .text("vertical exaggeration"),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(&mut v.terrain, "seafloor relief").on_hover_text(
+                "Bathymetry and land relief from the AWS Terrain Tiles, with the basemap draped and hill-shaded",
+            );
+            ui.checkbox(&mut v.show_drop_lines, "water column lines")
+                .on_hover_text("From each fix down to the seafloor");
+            ui.checkbox(&mut v.follow, "follow the animal");
+        });
+        ui.add(egui::Slider::new(&mut v.ground_dim, 0.0..=0.9).text("dim basemap"));
+        ui.add(
+            egui::Slider::new(&mut v.gap_factor, 1.5..=8.0)
+                .text("dotted if gap > × median interval"),
+        );
+    }
+
     /// Fixes used to place dives: the filtered location fixes of a track.
     fn located_fixes(&self, ti: usize) -> Vec<&Fix> {
         self.tracks[ti]
@@ -553,6 +699,49 @@ impl FinApp {
             "Wind at 10 m and 2 m: 'Wind & weather → Download & annotate (ERA5)'; 2 m uses a \
              logarithmic profile over the sea.",
         );
+        ui.separator();
+        self.ocean_layer_ui(ui);
+    }
+
+    /// Share value of the ocean map layer.
+    pub(super) fn ocean_layer_share(&self) -> Option<String> {
+        (self.mf_var != marine::FieldVar::Off || self.mf_arrows).then(|| {
+            format!(
+                "{:?},{},{},{},{}",
+                self.mf_var,
+                self.mf_arrows as u8,
+                self.mf_margin_deg,
+                self.mf_stride,
+                self.mf_opacity
+            )
+        })
+    }
+
+    pub(super) fn ocean_layer_apply(&mut self, s: Option<&str>) {
+        self.mf_var = marine::FieldVar::Off;
+        self.mf_arrows = false;
+        let Some(s) = s else {
+            return;
+        };
+        let p: Vec<&str> = s.split(',').collect();
+        if let Some(v) = p.first().and_then(|n| {
+            marine::FieldVar::ALL
+                .iter()
+                .find(|v| format!("{v:?}") == *n)
+        }) {
+            self.mf_var = *v;
+        }
+        let num = |i: usize| p.get(i).and_then(|x| x.parse::<f64>().ok());
+        self.mf_arrows = num(1).is_some_and(|x| x != 0.0);
+        if let Some(x) = num(2) {
+            self.mf_margin_deg = (x as f32).clamp(0.3, 10.0);
+        }
+        if let Some(x) = num(3) {
+            self.mf_stride = (x as i32).clamp(1, 10);
+        }
+        if let Some(x) = num(4) {
+            self.mf_opacity = (x as f32).clamp(0.1, 1.0);
+        }
     }
 
     /// Share value of the ocean settings.
@@ -591,6 +780,139 @@ impl FinApp {
             self.deep_only = donly != 0.0;
             self.dive_window_h = win as f32;
             self.apply_speed_filter();
+        }
+    }
+}
+
+/// Ocean layer drawn on the 2D map for the cursor hour.
+pub(super) struct OceanDraw {
+    var: marine::FieldVar,
+    field: marine::Field,
+    range: Option<(f32, f32)>,
+    arrows: bool,
+    alpha: u8,
+}
+
+/// Colour bar of the ocean layer.
+pub(super) struct OceanLegend {
+    pub title: &'static str,
+    pub lo: String,
+    pub hi: String,
+    var: marine::FieldVar,
+}
+
+impl OceanLegend {
+    pub fn color(&self, x: f32) -> Color32 {
+        ocean_color(self.var, x)
+    }
+}
+
+/// Colour of a normalised (0..1) value of an ocean variable.
+fn ocean_color(var: marine::FieldVar, x: f32) -> Color32 {
+    use marine::FieldVar as V;
+    match var {
+        V::Sst => turbo(x),
+        V::SeaLevel => diverging(x * 2.0 - 1.0),
+        V::CurrentSpeed => {
+            let [r, g, b] = crate::dives::depth_rgb(6000.0 * (1.0 - x.clamp(0.0, 1.0)));
+            Color32::from_rgb(r, g, b)
+        }
+        _ => viridis(x),
+    }
+}
+
+impl OceanDraw {
+    pub fn legend(&self) -> Option<OceanLegend> {
+        let (lo, hi) = self.range?;
+        let unit = match self.var {
+            marine::FieldVar::Sst => " °C",
+            marine::FieldVar::WavePeriod => " s",
+            marine::FieldVar::CurrentSpeed => " m/s",
+            _ => " m",
+        };
+        let d = if hi - lo < 2.0 { 2 } else { 1 };
+        Some(OceanLegend {
+            title: self.var.label(),
+            lo: format!("{lo:.d$}{unit}"),
+            hi: format!("{hi:.d$}{unit}"),
+            var: self.var,
+        })
+    }
+
+    pub fn paint(&self, painter: &egui::Painter, to_screen: &dyn Fn(f64, f64) -> Pos2) {
+        let g = &self.field;
+        if let Some((lo, hi)) = self.range {
+            let mut mesh = egui::Mesh::default();
+            let mut idx = vec![u32::MAX; g.ni * g.nj];
+            for a in 0..g.ni {
+                for b in 0..g.nj {
+                    let v = g.at(a, b);
+                    if !v.is_finite() {
+                        continue;
+                    }
+                    let (la, lo_) = g.latlon(a as f64, b as f64);
+                    idx[a * g.nj + b] = mesh.vertices.len() as u32;
+                    let c = ocean_color(self.var, (v - lo) / (hi - lo));
+                    mesh.colored_vertex(
+                        to_screen(la, lo_),
+                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), self.alpha),
+                    );
+                }
+            }
+            for a in 0..g.ni.saturating_sub(1) {
+                for b in 0..g.nj.saturating_sub(1) {
+                    let q = [
+                        idx[a * g.nj + b],
+                        idx[a * g.nj + b + 1],
+                        idx[(a + 1) * g.nj + b],
+                        idx[(a + 1) * g.nj + b + 1],
+                    ];
+                    if q.iter().all(|&i| i != u32::MAX) {
+                        mesh.add_triangle(q[0], q[1], q[3]);
+                        mesh.add_triangle(q[0], q[3], q[2]);
+                    } else if q.iter().filter(|&&i| i != u32::MAX).count() == 3 {
+                        let t: Vec<u32> = q.iter().copied().filter(|&i| i != u32::MAX).collect();
+                        mesh.add_triangle(t[0], t[1], t[2]);
+                    }
+                }
+            }
+            painter.add(egui::Shape::mesh(mesh));
+        }
+        if self.arrows {
+            // thin the lattice so arrows are ≥ 26 px apart
+            let (p0, p1) = (
+                to_screen(g.latlon(0.0, 0.0).0, g.latlon(0.0, 0.0).1),
+                to_screen(g.latlon(0.0, 1.0).0, g.latlon(0.0, 1.0).1),
+            );
+            let px = (p1 - p0).length().max(0.1);
+            let skip = ((26.0 / px).ceil() as usize).max(1);
+            let halo = Stroke::new(3.0, Color32::from_black_alpha(140));
+            let pen = Stroke::new(1.4, Color32::from_rgb(235, 245, 255));
+            for a in (0..g.ni).step_by(skip) {
+                for b in (0..g.nj).step_by(skip) {
+                    let (u, w) = g.current(a, b);
+                    if !(u.is_finite() && w.is_finite()) {
+                        continue;
+                    }
+                    let sp = (u * u + w * w).sqrt();
+                    if sp < 0.01 {
+                        continue;
+                    }
+                    let (la, lo) = g.latlon(a as f64, b as f64);
+                    let c = to_screen(la, lo);
+                    // 1 m/s = 22 px (capped)
+                    let len = (sp * 22.0).clamp(4.0, 30.0);
+                    let dir = vec2(u, -w) / sp;
+                    let (s0, s1) = (c - dir * len * 0.5, c + dir * len * 0.5);
+                    let side = vec2(-dir.y, dir.x) * 3.5;
+                    let back = s1 - dir * 6.0;
+                    for st in [halo, pen] {
+                        painter.line_segment([s0, s1], st);
+                        painter.line_segment([s1, back + side], st);
+                        painter.line_segment([s1, back - side], st);
+                    }
+                }
+            }
         }
     }
 }

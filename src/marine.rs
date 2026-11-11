@@ -239,30 +239,33 @@ impl MarineStore {
         Ok(n)
     }
 
-    /// Values at a point and time, linearly interpolated between the bracketing hours
-    /// (directions on the circle). Falls back to the 8 neighbouring cells when the point's
+    /// Values of one cell at time `t`, linearly interpolated between the bracketing hours
+    /// (directions on the circle).
+    pub fn sample_cell(&self, k: CellKey, t: i64) -> Option<Values> {
+        let s = self.cells.get(&k)?;
+        let h0 = t.div_euclid(3600) * 3600;
+        let a = s.get(&h0)?;
+        let Some(b) = s.get(&(h0 + 3600)) else {
+            return Some(*a);
+        };
+        let w = (t - h0) as f32 / 3600.0;
+        let mut o = [f32::NAN; NV];
+        for i in 0..NV {
+            o[i] = if i == 1 || i == 5 {
+                let d = ((b[i] - a[i] + 540.0) % 360.0) - 180.0;
+                (a[i] + d * w).rem_euclid(360.0)
+            } else {
+                a[i] + (b[i] - a[i]) * w
+            };
+        }
+        Some(o)
+    }
+
+    /// Values at a point and time; falls back to the 8 neighbouring cells when the point's
     /// own cell has no sea data (coast).
     pub fn sample(&self, lat: f64, lon: f64, t: i64) -> Option<Values> {
         let k = cell_of(lat, lon);
-        let try_cell = |k: CellKey| -> Option<Values> {
-            let s = self.cells.get(&k)?;
-            let h0 = t.div_euclid(3600) * 3600;
-            let a = s.get(&h0)?;
-            let Some(b) = s.get(&(h0 + 3600)) else {
-                return Some(*a);
-            };
-            let w = (t - h0) as f32 / 3600.0;
-            let mut o = [f32::NAN; NV];
-            for i in 0..NV {
-                o[i] = if i == 1 || i == 5 {
-                    let d = ((b[i] - a[i] + 540.0) % 360.0) - 180.0;
-                    (a[i] + d * w).rem_euclid(360.0)
-                } else {
-                    a[i] + (b[i] - a[i]) * w
-                };
-            }
-            Some(o)
-        };
+        let try_cell = |k: CellKey| self.sample_cell(k, t);
         try_cell(k).or_else(|| {
             (-1..=1)
                 .flat_map(|a| (-1..=1).map(move |b| (a, b)))
@@ -307,6 +310,206 @@ pub fn annotate(tracks: &mut [Track], store: &MarineStore) -> usize {
         }
     }
     n
+}
+
+/// Ocean variables drawn as a map layer around the animals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FieldVar {
+    Off,
+    Sst,
+    WaveHeight,
+    SwellHeight,
+    WavePeriod,
+    CurrentSpeed,
+    SeaLevel,
+}
+
+impl FieldVar {
+    pub const ALL: [FieldVar; 7] = [
+        FieldVar::Off,
+        FieldVar::Sst,
+        FieldVar::CurrentSpeed,
+        FieldVar::WaveHeight,
+        FieldVar::SwellHeight,
+        FieldVar::WavePeriod,
+        FieldVar::SeaLevel,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            FieldVar::Off => "off",
+            FieldVar::Sst => "Sea surface temperature (°C)",
+            FieldVar::WaveHeight => "Significant wave height (m)",
+            FieldVar::SwellHeight => "Swell height (m)",
+            FieldVar::WavePeriod => "Wave period (s)",
+            FieldVar::CurrentSpeed => "Surface current speed (m/s)",
+            FieldVar::SeaLevel => "Sea level incl. tides (m)",
+        }
+    }
+    /// Index into [`Values`].
+    pub fn index(self) -> Option<usize> {
+        Some(match self {
+            FieldVar::Off => return None,
+            FieldVar::Sst => 6,
+            FieldVar::WaveHeight => 0,
+            FieldVar::SwellHeight => 3,
+            FieldVar::WavePeriod => 2,
+            FieldVar::CurrentSpeed => 4,
+            FieldVar::SeaLevel => 7,
+        })
+    }
+}
+
+/// A lattice of ocean values at one time: node (a, b) is cell (i0 + a·step, j0 + b·step).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Field {
+    pub i0: i32,
+    pub j0: i32,
+    pub step: i32,
+    pub ni: usize,
+    pub nj: usize,
+    /// The chosen variable (NaN where missing / land).
+    pub v: Vec<f32>,
+    /// Surface current east / north components (m/s).
+    pub u: Vec<f32>,
+    pub w: Vec<f32>,
+}
+
+impl Field {
+    pub fn at(&self, a: usize, b: usize) -> f32 {
+        self.v[a * self.nj + b]
+    }
+    pub fn current(&self, a: usize, b: usize) -> (f32, f32) {
+        (self.u[a * self.nj + b], self.w[a * self.nj + b])
+    }
+    pub fn latlon(&self, a: f64, b: f64) -> (f64, f64) {
+        (
+            (self.i0 as f64 + a * self.step as f64) * GRID,
+            (self.j0 as f64 + b * self.step as f64) * GRID,
+        )
+    }
+    /// Range of the finite values (2nd – 98th percentile, so a few outliers don't wash it out).
+    pub fn range(&self) -> Option<(f32, f32)> {
+        let mut v: Vec<f32> = self.v.iter().copied().filter(|x| x.is_finite()).collect();
+        if v.is_empty() {
+            return None;
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+        let (lo, hi) = (q(0.02), q(0.98));
+        Some(if hi - lo < 1e-3 {
+            (lo - 0.5, hi + 0.5)
+        } else {
+            (lo, hi)
+        })
+    }
+}
+
+/// The cached cells on the `step`-cell lattice at time `t`, as a [`Field`].
+pub fn field(store: &MarineStore, t: i64, step: i32, var: FieldVar) -> Option<Field> {
+    let st = step.max(1);
+    let keys: Vec<CellKey> = store
+        .cells
+        .keys()
+        .copied()
+        .filter(|k| k.0.rem_euclid(st) == 0 && k.1.rem_euclid(st) == 0)
+        .collect();
+    if keys.len() < 4 {
+        return None;
+    }
+    let (i0, i1) = keys
+        .iter()
+        .fold((i32::MAX, i32::MIN), |a, k| (a.0.min(k.0), a.1.max(k.0)));
+    let (j0, j1) = keys
+        .iter()
+        .fold((i32::MAX, i32::MIN), |a, k| (a.0.min(k.1), a.1.max(k.1)));
+    let ni = ((i1 - i0) / st + 1) as usize;
+    let nj = ((j1 - j0) / st + 1) as usize;
+    if ni * nj > 400_000 {
+        return None;
+    }
+    let mut f = Field {
+        i0,
+        j0,
+        step: st,
+        ni,
+        nj,
+        v: vec![f32::NAN; ni * nj],
+        u: vec![f32::NAN; ni * nj],
+        w: vec![f32::NAN; ni * nj],
+    };
+    let mut any = false;
+    for k in keys {
+        let Some(vals) = store.sample_cell(k, t) else {
+            continue;
+        };
+        let n = ((k.0 - i0) / st) as usize * nj + ((k.1 - j0) / st) as usize;
+        if let Some(i) = var.index() {
+            f.v[n] = vals[i];
+        }
+        let (s, d) = (vals[4], vals[5]);
+        if s.is_finite() && d.is_finite() {
+            let r = d.to_radians();
+            f.u[n] = s * r.sin();
+            f.w[n] = s * r.cos();
+        }
+        any |= f.v[n].is_finite() || f.u[n].is_finite();
+    }
+    any.then_some(f)
+}
+
+/// Lattice nodes (every `stride` 0.1° cells) within `margin_deg` of each visible animal's
+/// position, for each of `ndays` days from `day0`: (lat, lon, unix s at noon).
+pub fn window_points(
+    tracks: &[Track],
+    day0: i64,
+    ndays: i64,
+    margin_deg: f64,
+    stride: i32,
+) -> Vec<(f64, f64, i64)> {
+    let st = stride.max(1);
+    let r = (margin_deg / GRID).ceil() as i32;
+    let mut set: HashSet<(CellKey, i64)> = HashSet::new();
+    for tr in tracks.iter().filter(|t| t.visible) {
+        let Some((t0, t1)) = tr.time_range() else {
+            continue;
+        };
+        for d in day0..day0 + ndays.max(1) {
+            for h in [0, 12, 24] {
+                let t = d * 86400 + h * 3600;
+                if t < t0 - 43_200 || t > t1 + 43_200 {
+                    continue;
+                }
+                let Some((la, lo, _)) = tr.position_at(t.clamp(t0, t1) as f64) else {
+                    continue;
+                };
+                let c = cell_of(la, lo);
+                // a circle-ish window (cos-latitude corrected in longitude)
+                let rj = ((r as f64) / la.to_radians().cos().max(0.2)).ceil() as i32;
+                let mut i = (c.0 - r).div_euclid(st) * st;
+                while i <= c.0 + r {
+                    let mut j = (c.1 - rj).div_euclid(st) * st;
+                    while j <= c.1 + rj {
+                        set.insert(((i, j), d));
+                        j += st;
+                    }
+                    i += st;
+                }
+            }
+        }
+    }
+    let mut pts: Vec<(f64, f64, i64)> = set
+        .into_iter()
+        .map(|(k, d)| {
+            let (la, lo) = cell_center(k);
+            (la, lo, d * 86400 + 43_200)
+        })
+        .collect();
+    pts.sort_by(|a, b| {
+        a.2.cmp(&b.2)
+            .then(a.0.total_cmp(&b.0))
+            .then(a.1.total_cmp(&b.1))
+    });
+    pts
 }
 
 /// Fix locations to download for (lat, lon, unix s).
@@ -386,6 +589,57 @@ mod tests {
             st.ingest(&req, r#"{"error":true,"reason":"nope"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn field_and_window() {
+        let mut st = MarineStore::default();
+        let t0 = 1_719_792_000;
+        let cells: Vec<CellKey> = (0..3)
+            .flat_map(|a| (0..3).map(move |b| (540 + 3 * a, 78 + 3 * b)))
+            .collect();
+        let req = Request::new(cells.clone(), t0 / 86400, t0 / 86400);
+        let one = |sst: f32| {
+            format!(
+                r#"{{"hourly_units":{{"ocean_current_velocity":"m/s"}},"hourly":{{"time":[{t0}],"wave_height":[1.0],"wave_direction":[0],"wave_period":[5],"swell_wave_height":[0.5],"ocean_current_velocity":[1.0],"ocean_current_direction":[90],"sea_surface_temperature":[{sst}],"sea_level_height_msl":[0.1]}}}}"#
+            )
+        };
+        let body = format!(
+            "[{}]",
+            (0..9)
+                .map(|k| one(10.0 + k as f32))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        st.ingest(&req, &body).unwrap();
+        let f = field(&st, t0, 3, FieldVar::Sst).unwrap();
+        assert_eq!((f.ni, f.nj), (3, 3));
+        assert_eq!(f.at(0, 0), 10.0);
+        assert_eq!(f.at(2, 2), 18.0);
+        let (u, w) = f.current(1, 1);
+        assert!((u - 1.0).abs() < 1e-5 && w.abs() < 1e-5, "eastward current");
+        let (la, lo) = f.latlon(1.0, 1.0);
+        assert!((la - 54.3).abs() < 1e-9 && (lo - 8.1).abs() < 1e-9);
+        let (lo_, hi_) = f.range().unwrap();
+        assert!(lo_ >= 10.0 && hi_ <= 18.0 && hi_ > lo_);
+        // a coarser lattice than the data has nothing
+        assert!(field(&st, t0, 7, FieldVar::Sst).is_none());
+
+        let mut tr = Track::new("a", "GPS", "test");
+        tr.fixes.push(Fix::new(t0, 54.2, 7.9, LocationSource::Gps));
+        tr.fixes
+            .push(Fix::new(t0 + 86400, 54.3, 7.9, LocationSource::Gps));
+        tr.compute_steps();
+        let pts = window_points(&[tr], t0 / 86400, 2, 0.5, 2);
+        assert!(!pts.is_empty());
+        assert!(pts.iter().all(|p| (p.0 - 54.25).abs() < 0.8));
+        // nodes sit on the 0.2° lattice
+        assert!(
+            pts.iter()
+                .all(|p| ((p.0 / GRID).round() as i32).rem_euclid(2) == 0)
+        );
+        let reqs = MarineStore::default().plan(&pts, 30_000);
+        assert!(reqs.iter().all(|r| r.cells.len() <= CELLS_PER_REQUEST));
     }
 
     #[test]
